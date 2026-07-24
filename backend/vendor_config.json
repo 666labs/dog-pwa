@@ -1,0 +1,20 @@
+{
+  "drinks": [
+    {"id": "cola",   "name": "可乐",   "color": "#e0312e", "arm_action": "pick_slot_1"},
+    {"id": "sprite", "name": "雪碧",   "color": "#2ea84f", "arm_action": "pick_slot_2"},
+    {"id": "water",  "name": "矿泉水", "color": "#2e7de0", "arm_action": "pick_slot_3"}
+  ],
+  "table":   {"x": 2.0, "y": 0.0},
+  "station": {"x": 0.0, "y": 0.0},
+  "robot_ip": null,
+  "transport": null,
+  "nav_blueprint": "unitree-go2-nav-3d",
+  "goal_topic": "/clicked_point",
+  "goal_frame_id": "map",
+  "pose_topic": "odometry",
+  "cancel_topic": "/tele_cmd_vel",
+  "arm_stub_delay_s": 5.0,
+  "arrival_radius_m": 0.35,
+  "nav_timeout_s": 90,
+  "result_display_s": 6
+}
