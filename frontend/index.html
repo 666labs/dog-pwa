@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f0f" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" href="/icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+  <link rel="stylesheet" href="/style.css" />
+  <title>dimOS Control</title>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="b1">dim</span><span class="b2">OS</span>
+      <span class="b3">Control</span>
+    </div>
+    <nav class="nav">
+      <button id="nav-connect" class="active" data-view="connect">Connect</button>
+      <button id="nav-dashboard" data-view="dashboard" disabled>Dashboard</button>
+    </nav>
+    <div id="conn-pill" class="pill">connecting</div>
+  </header>
+
+  <main>
+    <!-- ============================ VIEW 1: CONNECT WIZARD ============================ -->
+    <section id="view-connect" class="view">
+      <h1 class="view-title">Connect Robot</h1>
+      <ol class="wizard">
+
+        <!-- Step A: Wi-Fi provisioning -->
+        <li class="step" id="step-a" data-state="active">
+          <div class="step-head">
+            <div class="step-num">A</div>
+            <div class="step-title">Wi-Fi Provisioning <span class="muted">(over Bluetooth)</span></div>
+            <div class="step-badge" id="badge-a">ready</div>
+          </div>
+          <div class="step-body">
+            <div class="row">
+              <div class="grow">
+                <label for="wifi-ssid">Wi-Fi SSID</label>
+                <input id="wifi-ssid" type="text" placeholder="network name" />
+              </div>
+              <div class="grow">
+                <label for="wifi-pass">Wi-Fi Password</label>
+                <input id="wifi-pass" type="password" placeholder="password" />
+              </div>
+            </div>
+            <div class="row">
+              <div class="grow">
+                <label for="wifi-mac">Robot BLE MAC</label>
+                <input id="wifi-mac" type="text" placeholder="XX:XX:XX:XX:67:81" />
+              </div>
+              <div style="width:90px">
+                <label for="wifi-country">Country</label>
+                <input id="wifi-country" type="text" value="US" />
+              </div>
+            </div>
+            <p class="muted" style="font-size:11px">
+              Instead of MAC you may leave it blank and set a Serial or BLE name
+              below (one identifier is required).</p>
+            <div class="row">
+              <div class="grow">
+                <label for="wifi-serial">Serial <span class="opt">(optional)</span></label>
+                <input id="wifi-serial" type="text" placeholder="scan &amp; match" />
+              </div>
+              <div class="grow">
+                <label for="wifi-name">BLE Name <span class="opt">(optional)</span></label>
+                <input id="wifi-name" type="text" placeholder="e.g. Go2_49060" />
+              </div>
+            </div>
+            <div class="row">
+              <button id="btn-provision" class="btn primary">Provision Wi-Fi</button>
+              <button id="btn-skip-a" class="btn ghost">Skip (already on Wi-Fi)</button>
+            </div>
+            <div id="msg-a" class="msg"></div>
+          </div>
+        </li>
+
+        <!-- Step B: Find IP -->
+        <li class="step" id="step-b" data-state="pending">
+          <div class="step-head">
+            <div class="step-num">B</div>
+            <div class="step-title">Find Robot IP <span class="muted">(LAN discovery)</span></div>
+            <div class="step-badge" id="badge-b">pending</div>
+          </div>
+          <div class="step-body">
+            <p class="muted" style="font-size:11px">
+              The robot's Wi-Fi MAC may differ from its BLE MAC (sequential
+              allocation). Enter the MAC to match, or leave blank to list all
+              robots found on the LAN.</p>
+            <div class="row">
+              <input id="find-mac" class="grow" type="text" placeholder="MAC or suffix, e.g. 67:82" />
+              <button id="btn-find" class="btn primary">Search LAN</button>
+            </div>
+            <div id="find-searching" class="msg"></div>
+            <div id="find-result"></div>
+            <div class="row" id="ip-override-row" hidden>
+              <input id="ip-manual" class="grow" type="text" placeholder="or type an IP manually" />
+              <button id="btn-use-ip" class="btn">Use this IP</button>
+            </div>
+            <div id="msg-b" class="msg"></div>
+          </div>
+        </li>
+
+        <!-- Step C: WebRTC connection check -->
+        <li class="step" id="step-c" data-state="pending">
+          <div class="step-head">
+            <div class="step-num">C</div>
+            <div class="step-title">Live Connection Check</div>
+            <div class="step-badge" id="badge-c">pending</div>
+          </div>
+          <div class="step-body">
+            <div class="kv">
+              <dt>Target IP</dt><dd id="target-ip">—</dd>
+              <dt>Blueprint</dt><dd>unitree-go2-basic</dd>
+            </div>
+            <div class="row">
+              <button id="btn-connect" class="btn primary" disabled>Connect &amp; verify</button>
+            </div>
+            <div id="msg-c" class="msg"></div>
+            <div id="connect-evidence" class="tiles" hidden></div>
+            <div class="row" id="goto-dash-row" hidden>
+              <button id="btn-goto-dash" class="btn primary">Open Dashboard &rarr;</button>
+            </div>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <!-- ============================ VIEW 2: DASHBOARD ============================ -->
+    <section id="view-dashboard" class="view" hidden>
+      <h1 class="view-title">Dashboard</h1>
+      <div class="grid">
+
+        <!-- Status -->
+        <section class="panel" id="p-status">
+          <h2>Status</h2>
+          <div id="status-body"><div class="big-state idle">idle</div></div>
+          <div class="row">
+            <button id="btn-stop" class="btn danger" disabled>Stop</button>
+            <button id="btn-restart" class="btn" disabled>Restart</button>
+          </div>
+          <div class="row" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--dim-2)">
+            <button id="btn-server-shutdown" class="btn danger" title="Tears down THIS control panel server itself — not the robot connection. Use when a stuck/duplicate instance needs clearing without a terminal.">Shutdown panel server</button>
+          </div>
+        </section>
+
+        <!-- Teleop -->
+        <section class="panel span2" id="p-teleop">
+          <h2>Teleop <span class="sub">press &amp; hold to move · release to stop</span></h2>
+          <div class="teleop-wrap">
+            <div class="dpad" id="dpad">
+              <button class="tbtn" data-dir="rot-left">&#8634;<small>yaw L</small></button>
+              <button class="tbtn" data-dir="forward">&#9650;<small>fwd</small></button>
+              <button class="tbtn" data-dir="rot-right">&#8635;<small>yaw R</small></button>
+              <button class="tbtn" data-dir="left">&#9664;<small>strafe L</small></button>
+              <button class="tbtn blank" disabled></button>
+              <button class="tbtn" data-dir="right">&#9654;<small>strafe R</small></button>
+              <button class="tbtn blank" disabled></button>
+              <button class="tbtn" data-dir="back">&#9660;<small>back</small></button>
+              <button class="tbtn blank" disabled></button>
+            </div>
+            <div class="speed-row">
+              <span>SPEED</span>
+              <input id="speed" type="range" min="0.1" max="0.8" step="0.05" value="0.3" />
+              <span id="speed-val">0.30</span>
+            </div>
+            <button id="btn-estop" class="estop">&#9632; STOP</button>
+            <details class="teleop-adv">
+              <summary>advanced</summary>
+              <div class="row">
+                <div class="grow">
+                  <label for="teleop-topic">Twist topic</label>
+                  <input id="teleop-topic" type="text" value="/cmd_vel" />
+                </div>
+                <div style="width:130px">
+                  <label for="teleop-transport">Transport</label>
+                  <select id="teleop-transport">
+                    <option value="">default (LCM)</option>
+                    <option value="lcm">lcm</option>
+                    <option value="zenoh">zenoh</option>
+                  </select>
+                </div>
+              </div>
+              <p class="hint">No obstacle avoidance — you are the only safety. /cmd_vel is the Go2 velocity topic.</p>
+            </details>
+            <div id="msg-teleop" class="msg"></div>
+          </div>
+        </section>
+
+        <!-- Gestures & Sport (GO2Connection @rpc commands over the bus) -->
+        <section class="panel span2" id="p-sport">
+          <h2>Gestures &amp; Sport
+            <span class="sub">GO2Connection @rpc · returns accepted/failed</span>
+            <span id="battery-badge" class="pill" style="margin-left:auto">battery ?</span>
+          </h2>
+          <div class="sport-group">
+            <div class="sport-label">Utility</div>
+            <div class="sport-btns" id="sport-utility"></div>
+          </div>
+          <div class="sport-group">
+            <div class="sport-label">Gestures <span class="muted">(benign — safe to trigger)</span></div>
+            <div class="sport-btns" id="sport-gestures"></div>
+          </div>
+          <div class="sport-group">
+            <div class="sport-label" style="color:var(--red)">Athletic — real physical tricks</div>
+            <div class="sport-btns" id="sport-athletic"></div>
+            <p class="hint">Each requires confirmation. Ensure the robot has clear
+              space and you are watching it. Some may be firmware-gated on this unit.</p>
+          </div>
+          <div id="sport-msg" class="msg"></div>
+        </section>
+
+        <!-- Telemetry (replaces the dead 5555 camera panel) -->
+        <section class="panel span2" id="p-telemetry">
+          <h2>Telemetry <span class="sub">dimos spy · live topic rates</span></h2>
+          <div class="tiles" id="telemetry-grid"><p class="muted" style="font-size:11px">waiting for a run…</p></div>
+          <p class="hint" id="telemetry-note">This connection is intermittent — tiles flap green/grey as the robot's WebRTC link comes and goes. No obstacle avoidance; the human is the only safety.</p>
+        </section>
+
+        <!-- Live camera: plain low-latency MJPEG feed of /color_image (camera
+             daemon on its own port). The heavy Rerun debug viewer is kept only
+             as a secondary "Debug view" link for anyone who wants pointcloud/TF. -->
+        <section class="panel span2" id="p-camera">
+          <h2>Camera <span class="sub">/color_image · live MJPEG</span>
+            <a id="cam-debug" class="btn ghost" target="_blank" rel="noopener"
+               style="margin-left:auto;padding:4px 10px;font-size:11px" hidden>Debug view &#8599;</a>
+          </h2>
+          <div id="cam-body"><p class="muted" style="font-size:11px">checking for the camera feed…</p></div>
+        </section>
+
+        <!-- Live 3D map: the robot's ACTUAL lidar point cloud, rendered in a
+             custom raw-WebGL canvas (points colored by height, drag to orbit,
+             scroll to zoom). Data comes from the lidar daemon on its own port;
+             no Rerun, no CDN, no library — fully offline. The Rerun multi-panel
+             debugger is kept only as a secondary "Debug view" link. -->
+        <section class="panel span2" id="p-map">
+          <h2>3D Point Cloud <span class="sub">live lidar · WebGL · drag to orbit</span>
+            <a id="map-open" class="btn ghost" target="_blank" rel="noopener"
+               style="margin-left:auto;padding:4px 10px;font-size:11px" hidden>Debug view &#8599;</a>
+          </h2>
+          <div id="map-body"><p class="muted" style="font-size:11px">checking for the lidar point cloud…</p></div>
+        </section>
+
+        <!-- Odometry: real pose (x/y/yaw), via dimos_cli's lidar daemon which
+             also peeks /odom (Dimos.connect().peek_stream('odom') — confirmed
+             live tonight, direct .x/.y/.yaw properties, no quaternion math). -->
+        <section class="panel" id="p-sensors">
+          <h2>Odometry <span class="sub">/odom · live pose</span></h2>
+          <div class="tiles" id="pose-grid">
+            <div class="tile" id="pose-x"><div class="t-label">x (m)</div><div class="t-val">—</div></div>
+            <div class="tile" id="pose-y"><div class="t-label">y (m)</div><div class="t-val">—</div></div>
+            <div class="tile" id="pose-yaw"><div class="t-label">yaw (&deg;)</div><div class="t-val">—</div></div>
+            <div class="tile" id="pose-z"><div class="t-label">z (m)</div><div class="t-val">—</div></div>
+          </div>
+          <p class="hint" id="pose-hint">waiting for a run…</p>
+        </section>
+
+        <!-- Launcher -->
+        <section class="panel" id="p-launcher">
+          <h2>Launch Blueprint</h2>
+          <label for="blueprint">Blueprint</label>
+          <select id="blueprint"><option>loading…</option></select>
+          <label for="robot-ip">Robot IP <span class="opt">(optional)</span></label>
+          <input id="robot-ip" type="text" placeholder="10.76.3.187" />
+          <label for="transport">Transport</label>
+          <select id="transport">
+            <option value="">default (LCM)</option>
+            <option value="lcm">lcm</option>
+            <option value="zenoh">zenoh (fallback — no host setup)</option>
+          </select>
+          <button id="btn-run" class="btn primary">Run</button>
+          <div id="run-msg" class="msg"></div>
+        </section>
+
+        <!-- Live log -->
+        <section class="panel span2" id="p-log">
+          <h2>Live Log <span class="sub">dimos log -f --json</span></h2>
+          <div class="row">
+            <button id="btn-log-start" class="btn">Start</button>
+            <button id="btn-log-stop" class="btn ghost" disabled>Stop</button>
+            <span id="log-status" class="pill">stopped</span>
+          </div>
+          <div id="log-feed" class="feed"></div>
+        </section>
+
+        <!-- Topic rate check (spy-based; raw content not available in this build) -->
+        <section class="panel span2" id="p-topic">
+          <h2>Topic Rate <span class="sub">dimos spy · rate/type — raw content unavailable in this build</span></h2>
+          <p class="muted" style="font-size:11px">Check any topic (beyond the core telemetry set) for live rate &amp; type.
+            `dimos topic echo` never decodes in this install, so message content can't be shown — only whether it's publishing and how fast.</p>
+          <div class="row">
+            <input id="topic-name" class="grow" type="text" placeholder="any topic, e.g. /coordinator_joint_state" />
+            <select id="topic-transport" style="width:120px">
+              <option value="">transport</option>
+              <option value="lcm">lcm</option>
+              <option value="zenoh">zenoh</option>
+            </select>
+            <button id="btn-topic-check" class="btn">Check rate</button>
+            <span id="topic-status" class="pill">idle</span>
+          </div>
+          <div id="topic-result"></div>
+        </section>
+
+        <!-- Process cleanup -->
+        <section class="panel span2" id="p-procs">
+          <h2>Process Cleanup <span class="sub">dimos / rerun / humancli</span></h2>
+          <p class="muted" style="font-size:11px">The live run PID is protected and cannot be killed here (use Stop).</p>
+          <div class="row"><button id="btn-procs-refresh" class="btn">Refresh</button></div>
+          <div id="procs-body"></div>
+        </section>
+
+        <!-- Quick links -->
+        <section class="panel" id="p-links">
+          <h2>Quick Links</h2>
+          <p class="muted" style="font-size:11px">Opens on this device's host.</p>
+          <a id="link-web" class="btn ghost" target="_blank" rel="noopener">Web Interface :5555</a>
+          <a id="link-teleop" class="btn ghost" target="_blank" rel="noopener">Phone Teleop :8444/teleop</a>
+          <p class="hint">Teleop uses a self-signed cert — click through the browser warning.</p>
+        </section>
+
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span id="host-label"></span> · relative-path API · redeploy-safe
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
