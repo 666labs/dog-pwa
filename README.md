@@ -158,3 +158,17 @@ cd /home/alex/dev/AdventureX/dimos-pwa
 ./venv/bin/pip install fastapi uvicorn python-multipart psutil
 ./run.sh
 ```
+
+## 公网直播模式（Vercel 双模式页）
+
+`demo-site/` 部署在 Vercel 上，默认是浏览器内模拟。要让公网页面显示真实
+机器人画面/状态并可急停：
+
+1. 在跑控制面板的机器上开隧道：
+   `cloudflared tunnel --url http://localhost:8090`
+2. 打开 `https://<vercel域名>/?backend=<隧道URL>` —— 参数会记住
+   （localStorage），之后直接开裸域名也走真实后端；`?backend=off` 断开。
+
+摄像头经 8090 代理（`/api/camera/{go2|arm}/stream.mjpg`），隧道只需暴露
+一个端口。臂相机 USB 设备号在 `backend/vendor_config.json` 的
+`arm_camera_device`（默认 0）。改完共享前端后运行 `demo-site/sync.sh` 同步。
