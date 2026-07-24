@@ -377,6 +377,20 @@ async def api_vendor_reset():
     return await manager.reset()
 
 
+@router.get("/api/vendor/navlog")
+def api_vendor_navlog(lines: int = 40):
+    """nav_leg 日志尾巴 — 前端折叠面板的原始技术输出。"""
+    n = max(1, min(int(lines), 200))
+    try:
+        with open(_NAV_LEG_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 64 * 1024))
+            tail = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        tail = []
+    return {"lines": tail[-n:]}
+
+
 @router.post("/api/vendor/estop")
 async def api_vendor_estop():
     return await manager.estop()

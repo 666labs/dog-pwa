@@ -133,3 +133,19 @@ def test_events_pose_map_in_status(tmp_path, monkeypatch):
         assert st["pose"] is not None and "x" in st["pose"]  # fake 腿合成位姿
         assert st["map"]["table"] == {"x": 1.0, "y": 0.0}
         assert all("ts" in e and "zh" in e and "en" in e for e in st["events"])
+
+
+def test_navlog_tail(tmp_path, monkeypatch):
+    log = tmp_path / "nav.log"
+    log.write_text("line1\nline2\nline3\n")
+    monkeypatch.setenv("VENDOR_NAV_LOG", str(log))
+    app = make_app(tmp_path, monkeypatch)  # make_app 里 reload(vendor) 会重读环境
+    with TestClient(app) as client:
+        assert client.get("/api/vendor/navlog?lines=2").json()["lines"] == ["line2", "line3"]
+
+
+def test_navlog_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("VENDOR_NAV_LOG", str(tmp_path / "absent.log"))
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.get("/api/vendor/navlog").json()["lines"] == []
