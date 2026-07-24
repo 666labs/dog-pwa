@@ -18,7 +18,7 @@
 | 机械臂（Galaxea A1Z） | **只做接口 + stub**：定义固定的 ArmExecutor 接口，本次实现为可配置延时的模拟执行器；真实拓取动作由队友后续接入 |
 | 机器狗（Go2） | **真导航**：启动 dimOS nav blueprint（`unitree-go2-nav-3d`），下发硬编码桌位坐标，A* 规划 + 避障；**不做**脚本化速度序列兜底 |
 | Server 形态 | **扩展现有后端**：`backend/main.py`（8090 单进程）新增 vendor 模块，与现有 blueprint 进程管理共享状态，避免两个进程抢 Go2 唯一的 WebRTC 连接 |
-| 编排时序 | **全自动流水线**：点击后无人工干预推进到完成；仅保留一个全局 `reset` 紧急复位接口作为唯一人工出口 |
+| 编排时序 | **全自动流水线 + 一个取货确认点**：点击后自动推进；狗到桌后**暂停**等顾客按「确认取货」，确认后狗自动导航返回取餐站，到站订单完成。除此之外无人工干预；另保留全局 `reset` 紧急复位接口兜底（2026-07-25 补充决定，取代最初的「无任何中途确认」版本） |
 
 ## 3. 架构
 
@@ -30,10 +30,12 @@ vendor 编排器（backend/vendor.py，挂载进 main.py 的 FastAPI app）
    │  asyncio 状态机，同一时刻仅允许一个活动订单
    │
    ├─ 阶段1: ArmExecutor.pick(drink)      ← 本次为 stub（configurable delay + 日志）
-   ├─ 阶段2: DogExecutor.deliver(table)   ← 确保 nav blueprint 运行
+   ├─ 阶段2: DogExecutor.go_to(table)     ← 确保 nav blueprint 运行
    │           → nav_daemon 发布目标位姿 (x, y, yaw)
    │           → 轮询里程计，距目标 < arrival_radius 判定到达
    │           → 超时（nav_timeout_s）判定失败
+   ├─ 阶段3: 暂停等待顾客 POST /api/vendor/confirm（「确认取货」按钮，无超时）
+   ├─ 阶段4: DogExecutor.go_to(station)   ← 同阶段2逻辑，目标为取餐站坐标
    ▼
 GET /api/vendor/status ← 前端 1 Hz 轮询（与现有面板轮询风格一致）
 ```
@@ -46,7 +48,7 @@ GET /api/vendor/status ← 前端 1 Hz 轮询（与现有面板轮询风格一�
 - **APIRouter**：4 个路由（见 §6），在 `main.py` 中 `include_router`，一行接入。
 - **OrderManager**：内存态单订单状态机（见 §5），持有当前订单的 asyncio task。
 - **ArmExecutor（stub）**：`async def pick(drink: Drink) -> None`。实现为 `await asyncio.sleep(config.arm_stub_delay_s)` + 结构化日志（打出 drink 的 `arm_action` 标识）。接口即契约：队友的真实现替换这个类即可，编排器不改。
-- **DogExecutor**：`async def deliver(table: Table) -> None`。步骤：
+- **DogExecutor**：`async def go_to(goal: Pose) -> None`。送货腿（goal=table）和返程腿（goal=station）复用同一实现。步骤：
   1. 查 `dimos_cli.status()`——nav blueprint 未运行则 `run_blueprint()` 启动并等待就绪（就绪判据：里程计话题开始有数据，沿用现有 `/api/pose` 的读取路径；启动后 30 s 内无数据视为启动失败）；已有**其他** blueprint 在跑则先 `stop()` 再启动（尊重单 WebRTC 连接约束）。
   2. 通过 `nav_daemon` 发布目标位姿。
   3. 以 ~2 Hz 轮询里程计（复用现有 `/api/pose` 的底层读取），`dist(pose, goal) < arrival_radius` → 到达；超过 `nav_timeout_s` → 抛 `DeliveryTimeout`。
@@ -65,6 +67,7 @@ GET /api/vendor/status ← 前端 1 Hz 轮询（与现有面板轮询风格一�
     {"id": "water",  "name": "矿泉水", "color": "#2e7de0", "arm_action": "pick_slot_3"}
   ],
   "table": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+  "station": {"x": 0.0, "y": 0.0, "yaw": 0.0},
   "arm_stub_delay_s": 5.0,
   "arrival_radius_m": 0.35,
   "nav_timeout_s": 90,
@@ -72,12 +75,13 @@ GET /api/vendor/status ← 前端 1 Hz 轮询（与现有面板轮询风格一�
 }
 ```
 
-单桌位（demo 只有一张桌子）；`arm_action` 现在只进日志，将来原样传给真 ArmExecutor。
+单桌位（demo 只有一张桌子）；`station` 为取餐站/贩卖点初始位置（返程目标）；`arm_action` 现在只进日志，将来原样传给真 ArmExecutor。
 
 ### 4.4 `frontend/vendor.html` + `frontend/vendor.js`（新）
 - 顾客页，独立于现有仪表盘 `index.html`（顾客不应看到工程面板）；`main.py` 静态路由加 `/vendor`。
 - **点单态**：全屏大饮料卡片（从 `/api/vendor/menu` 渲染），适配 iPad 触摸。
-- **进度态**：点击后转全屏时间线：`已接单 → 机械臂取货中 → 机器狗配送中 → 已送达`，随 `/api/vendor/status` 推进；`failed` 显示失败原因和「重置」按钮（调 `/api/vendor/reset`）。
+- **进度态**：点击后转全屏时间线：`已接单 → 机械臂取货中 → 机器狗配送中 → 请取走饮料 → 机器狗返程中 → 已完成`，随 `/api/vendor/status` 推进；`failed` 显示失败原因和「重置」按钮（调 `/api/vendor/reset`）。
+- **取货确认**：`awaiting_pickup` 状态时显示全屏大按钮「我已取到饮料 ✓」（调 `POST /api/vendor/confirm`），按下后进入返程阶段。无超时——顾客不按就一直等（`reset` 兜底）。
 - 活动订单期间卡片置灰（后端同时以 409 保护）。
 - `delivered` / `failed` 展示 `result_display_s` 秒后自动回点单态。
 
@@ -89,16 +93,19 @@ GET /api/vendor/status ← 前端 1 Hz 轮询（与现有面板轮询风格一�
 ## 5. 订单状态机
 
 ```
-idle ──POST /order──▶ arm_picking ──stub完成──▶ dog_delivering ──到达──▶ delivered ──result_display_s──▶ idle
-                          │                        │                                   
-                          │ reset                  │ reset / DeliveryTimeout / nav启动失败
-                          ▼                        ▼
-                        idle                     failed ──result_display_s 或 reset──▶ idle
+idle ──POST /order──▶ arm_picking ──stub完成──▶ dog_delivering ──到达──▶ awaiting_pickup
+                                                                              │ POST /confirm
+                                                                              ▼
+        idle ◀──result_display_s── delivered ◀──到站── dog_returning ◀────────┘
+
+任一活动状态 ── reset ──▶ idle
+dog_delivering / dog_returning ── DeliveryTimeout / nav启动失败 ──▶ failed ──result_display_s 或 reset──▶ idle
 ```
 
 - 全内存态，不落盘；进程重启 = 回 `idle`（demo 可接受）。
-- 活动订单（`arm_picking` / `dog_delivering`）期间新点单返回 `409 {"error": "order_in_progress"}`。
-- `reset`：取消编排 task → 若 nav 在跑则发一次零速度并 `dimos_cli.stop()` → 状态回 `idle`。是唯一人工出口（用户明确选择全自动流水线，不设逐段确认）。
+- `awaiting_pickup` 无超时：顾客不按确认就一直等，`reset` 是唯一出口。
+- 活动订单（`arm_picking` / `dog_delivering` / `awaiting_pickup` / `dog_returning`）期间新点单返回 `409 {"error": "order_in_progress"}`。
+- `reset`：取消编排 task → 若 nav 在跑则发一次零速度并 `dimos_cli.stop()` → 状态回 `idle`。除「确认取货」按钮（流程的正常组成部分）外，`reset` 是唯一人工干预出口，不设其他逐段确认。
 
 ## 6. API
 
@@ -107,6 +114,7 @@ idle ──POST /order──▶ arm_picking ──stub完成──▶ dog_delive
 | GET | `/api/vendor/menu` | — | `{drinks: [{id, name, color}]}` | 前端渲染卡片 |
 | POST | `/api/vendor/order` | `{drink_id}` | `200 {order_id}` / `409` / `404`（未知 drink_id） | 触发流水线 |
 | GET | `/api/vendor/status` | — | `{state, drink_id, stage_started_at, error, progress: {dist_to_goal}}` | 1 Hz 轮询 |
+| POST | `/api/vendor/confirm` | — | `200` / `409`（非 `awaiting_pickup` 状态） | 「确认取货」按钮，触发返程 |
 | POST | `/api/vendor/reset` | — | `200 {state: "idle"}` | 紧急复位，任何状态可调 |
 
 ## 7. 错误处理
@@ -114,7 +122,7 @@ idle ──POST /order──▶ arm_picking ──stub完成──▶ dog_delive
 | 故障 | 行为 |
 |---|---|
 | nav blueprint 启动失败 | 订单 → `failed`，`error` 带 dimos stderr 摘要 |
-| 导航超时（`nav_timeout_s`） | 订单 → `failed`，狗停在原地（nav blueprint 继续跑，不自动 stop，便于人工接管） |
+| 导航超时（`nav_timeout_s`，送货腿与返程腿同样适用） | 订单 → `failed`，狗停在原地（nav blueprint 继续跑，不自动 stop，便于人工接管） |
 | 里程计读取中断 | 连续 10 s 读不到 → 视同超时 → `failed` |
 | 未知 drink_id / 并发点单 | 404 / 409，不影响当前订单 |
 | 任何卡死 | `POST /api/vendor/reset` 全局兜底 |
@@ -137,5 +145,5 @@ idle ──POST /order──▶ arm_picking ──stub完成──▶ dog_delive
 ## 10. 遗留的现场任务（非代码）
 
 1. Ascent 上跑 `sudo ./setup.sh`（见 `ASCENT_HANDOVER.md` §4）。
-2. 现场建图 + 标定桌位坐标，写入 `vendor_config.json` 的 `table`。
+2. 现场建图 + 标定桌位坐标和取餐站坐标，写入 `vendor_config.json` 的 `table` 与 `station`。
 3. 确认演示时只有 vendor 流程占用 Go2 连接（`dimos status` / 清理孤儿进程）。
