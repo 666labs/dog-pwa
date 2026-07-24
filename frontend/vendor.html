@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>dimOS 饮料速递</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Noto Sans SC", sans-serif;
+    background: #0e1116; color: #e8eaed;
+    display: flex; flex-direction: column;
+    user-select: none; -webkit-user-select: none;
+  }
+  header {
+    padding: 20px 28px; display: flex; align-items: baseline; gap: 12px;
+    border-bottom: 1px solid #1d2330;
+  }
+  header h1 { font-size: 22px; font-weight: 700; letter-spacing: .5px; }
+  header .sub { font-size: 13px; color: #7d879c; }
+  #fakeBadge {
+    margin-left: auto; font-size: 12px; color: #d9a441;
+    border: 1px solid #d9a441; border-radius: 6px; padding: 2px 8px; display: none;
+  }
+
+  /* ---- 菜单 ---- */
+  #menu {
+    flex: 1; display: grid; gap: 22px; padding: 28px;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    align-content: center;
+  }
+  .card {
+    border: 1px solid #232a3a; border-radius: 20px; background: #141926;
+    padding: 34px 20px; text-align: center; cursor: pointer;
+    transition: transform .12s ease, border-color .12s ease;
+    min-height: 230px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px;
+  }
+  .card:active { transform: scale(.96); }
+  .card .dot { width: 74px; height: 74px; border-radius: 50%; }
+  .card .name { font-size: 26px; font-weight: 700; }
+  .card .hint { font-size: 13px; color: #7d879c; }
+
+  /* ---- 进度 ---- */
+  #progress { flex: 1; display: none; flex-direction: column; align-items: center;
+              justify-content: center; padding: 28px; gap: 34px; }
+  #orderTitle { font-size: 24px; font-weight: 700; }
+  #stages { display: flex; flex-direction: column; gap: 14px; width: min(560px, 92vw); }
+  .stage {
+    display: flex; align-items: center; gap: 14px; padding: 13px 18px;
+    border-radius: 12px; border: 1px solid #232a3a; background: #141926;
+    font-size: 17px; color: #7d879c;
+  }
+  .stage .idx {
+    width: 28px; height: 28px; border-radius: 50%; border: 2px solid #2b3040;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; flex-shrink: 0;
+  }
+  .stage.done { color: #9aa3b5; }
+  .stage.done .idx { border-color: #2ea84f; color: #2ea84f; }
+  .stage.active { color: #fff; border-color: #3d6ff2; background: #17203a; }
+  .stage.active .idx { border-color: #3d6ff2; color: #3d6ff2; }
+  .stage.active .idx::after { content: ""; }
+  #distLine { font-size: 15px; color: #7d879c; min-height: 20px; }
+
+  .bigBtn {
+    font-size: 24px; font-weight: 700; color: #fff; border: none; cursor: pointer;
+    border-radius: 18px; padding: 26px 44px; width: min(560px, 92vw);
+    background: #2ea84f; display: none;
+  }
+  .bigBtn:active { filter: brightness(.85); }
+
+  #doneMark { display: none; font-size: 64px; }
+  #failBox { display: none; flex-direction: column; align-items: center; gap: 18px; }
+  #failMsg { color: #e0655e; font-size: 17px; text-align: center; max-width: 80vw; }
+  #resetBtn {
+    font-size: 18px; color: #fff; background: #b0413b; border: none;
+    border-radius: 12px; padding: 14px 34px; cursor: pointer;
+  }
+  #miniReset {
+    position: fixed; right: 16px; bottom: 14px; font-size: 12px; color: #4a5468;
+    background: none; border: none; cursor: pointer; padding: 8px;
+  }
+  #toast {
+    position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
+    background: #17203a; border: 1px solid #3d6ff2; color: #fff;
+    padding: 10px 22px; border-radius: 10px; font-size: 15px;
+    opacity: 0; pointer-events: none; transition: opacity .25s;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>🤖 dimOS 饮料速递</h1>
+    <span class="sub">点一杯，机器人送到你桌上</span>
+    <span id="fakeBadge">模拟模式</span>
+  </header>
+
+  <div id="menu"></div>
+
+  <div id="progress">
+    <div id="orderTitle"></div>
+    <div id="stages"></div>
+    <div id="distLine"></div>
+    <div id="doneMark">🎉</div>
+    <button id="confirmBtn" class="bigBtn">我已取到饮料 ✓</button>
+    <div id="failBox">
+      <div id="failMsg"></div>
+      <button id="resetBtn">重置</button>
+    </div>
+  </div>
+
+  <button id="miniReset" title="紧急复位">复位</button>
+  <div id="toast"></div>
+
+<script src="vendor.js"></script>
+</body>
+</html>
