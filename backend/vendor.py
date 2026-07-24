@@ -79,7 +79,8 @@ class OrderManager:
 
     async def place_order(self, drink: dict, cfg: dict) -> dict:
         self.order_seq += 1
-        self.drink = {"id": drink["id"], "name": drink["name"]}
+        self.drink = {"id": drink["id"], "name": drink["name"],
+                      "name_en": drink.get("name_en", "")}
         self._set(ARM_PICKING)
         self._task = asyncio.create_task(self._run_order(drink, cfg))
         return {"order_id": self.order_seq}
@@ -239,7 +240,8 @@ manager = OrderManager()
 def api_vendor_menu():
     cfg = load_config()
     return {"drinks": [
-        {"id": d["id"], "name": d["name"], "color": d.get("color", "#888888")}
+        {"id": d["id"], "name": d["name"], "name_en": d.get("name_en", ""),
+         "icon": d.get("icon", "🥤"), "color": d.get("color", "#888888")}
         for d in cfg.get("drinks", [])
     ]}
 

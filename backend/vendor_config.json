@@ -1,8 +1,8 @@
 {
   "drinks": [
-    {"id": "cola",   "name": "可乐",   "color": "#e0312e", "arm_action": "pick_slot_1"},
-    {"id": "sprite", "name": "雪碧",   "color": "#2ea84f", "arm_action": "pick_slot_2"},
-    {"id": "water",  "name": "矿泉水", "color": "#2e7de0", "arm_action": "pick_slot_3"}
+    {"id": "cola",   "name": "可乐",   "name_en": "Cola",   "icon": "🥤", "color": "#e0312e", "arm_action": "pick_slot_1"},
+    {"id": "sprite", "name": "雪碧",   "name_en": "Sprite", "icon": "🍋", "color": "#2ea84f", "arm_action": "pick_slot_2"},
+    {"id": "water",  "name": "矿泉水", "name_en": "Water",  "icon": "💧", "color": "#2e7de0", "arm_action": "pick_slot_3"}
   ],
   "table":   {"x": 2.0, "y": 0.0},
   "station": {"x": 0.0, "y": 0.0},

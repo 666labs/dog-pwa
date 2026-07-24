@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>dimOS 饮料速递</title>
+<title>dimOS 饮料速递 · Drink Delivery</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%; }
@@ -13,18 +13,20 @@
     display: flex; flex-direction: column;
     user-select: none; -webkit-user-select: none;
   }
+  .en { color: #7d879c; font-weight: 400; }
   header {
     padding: 20px 28px; display: flex; align-items: baseline; gap: 12px;
     border-bottom: 1px solid #1d2330;
   }
   header h1 { font-size: 22px; font-weight: 700; letter-spacing: .5px; }
+  header h1 .en { font-size: 15px; margin-left: 6px; }
   header .sub { font-size: 13px; color: #7d879c; }
   #fakeBadge {
     margin-left: auto; font-size: 12px; color: #d9a441;
     border: 1px solid #d9a441; border-radius: 6px; padding: 2px 8px; display: none;
   }
 
-  /* ---- 菜单 ---- */
+  /* ---- 菜单 / menu ---- */
   #menu {
     flex: 1; display: grid; gap: 22px; padding: 28px;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -32,23 +34,29 @@
   }
   .card {
     border: 1px solid #232a3a; border-radius: 20px; background: #141926;
-    padding: 34px 20px; text-align: center; cursor: pointer;
+    padding: 30px 20px; text-align: center; cursor: pointer;
     transition: transform .12s ease, border-color .12s ease;
-    min-height: 230px; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; gap: 18px;
+    min-height: 250px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
   }
   .card:active { transform: scale(.96); }
-  .card .dot { width: 74px; height: 74px; border-radius: 50%; }
+  .card .dot {
+    width: 88px; height: 88px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 46px; line-height: 1;
+  }
   .card .name { font-size: 26px; font-weight: 700; }
-  .card .hint { font-size: 13px; color: #7d879c; }
+  .card .name-en { font-size: 16px; color: #7d879c; margin-top: -6px; }
+  .card .hint { font-size: 13px; color: #7d879c; margin-top: 6px; }
 
-  /* ---- 进度 ---- */
+  /* ---- 进度 / progress ---- */
   #progress { flex: 1; display: none; flex-direction: column; align-items: center;
               justify-content: center; padding: 28px; gap: 34px; }
-  #orderTitle { font-size: 24px; font-weight: 700; }
+  #orderTitle { font-size: 24px; font-weight: 700; text-align: center; }
+  #orderTitle .en { font-size: 16px; display: block; margin-top: 6px; }
   #stages { display: flex; flex-direction: column; gap: 14px; width: min(560px, 92vw); }
   .stage {
-    display: flex; align-items: center; gap: 14px; padding: 13px 18px;
+    display: flex; align-items: center; gap: 14px; padding: 11px 18px;
     border-radius: 12px; border: 1px solid #232a3a; background: #141926;
     font-size: 17px; color: #7d879c;
   }
@@ -57,18 +65,20 @@
     display: flex; align-items: center; justify-content: center;
     font-size: 14px; flex-shrink: 0;
   }
+  .stage .lbl { display: flex; flex-direction: column; }
+  .stage .lbl .en { font-size: 12px; }
   .stage.done { color: #9aa3b5; }
   .stage.done .idx { border-color: #2ea84f; color: #2ea84f; }
   .stage.active { color: #fff; border-color: #3d6ff2; background: #17203a; }
   .stage.active .idx { border-color: #3d6ff2; color: #3d6ff2; }
-  .stage.active .idx::after { content: ""; }
   #distLine { font-size: 15px; color: #7d879c; min-height: 20px; }
 
   .bigBtn {
     font-size: 24px; font-weight: 700; color: #fff; border: none; cursor: pointer;
-    border-radius: 18px; padding: 26px 44px; width: min(560px, 92vw);
-    background: #2ea84f; display: none;
+    border-radius: 18px; padding: 22px 44px; width: min(560px, 92vw);
+    background: #2ea84f; display: none; line-height: 1.5;
   }
+  .bigBtn .en { color: #d9f2e0; font-size: 16px; display: block; }
   .bigBtn:active { filter: brightness(.85); }
 
   #doneMark { display: none; font-size: 64px; }
@@ -86,15 +96,15 @@
     position: fixed; top: 18px; left: 50%; transform: translateX(-50%);
     background: #17203a; border: 1px solid #3d6ff2; color: #fff;
     padding: 10px 22px; border-radius: 10px; font-size: 15px;
-    opacity: 0; pointer-events: none; transition: opacity .25s;
+    opacity: 0; pointer-events: none; transition: opacity .25s; text-align: center;
   }
 </style>
 </head>
 <body>
   <header>
-    <h1>🤖 dimOS 饮料速递</h1>
-    <span class="sub">点一杯，机器人送到你桌上</span>
-    <span id="fakeBadge">模拟模式</span>
+    <h1>🤖 dimOS 饮料速递<span class="en">Drink Delivery</span></h1>
+    <span class="sub">点一杯，机器人送到你桌上 · Tap a drink, the robots bring it over</span>
+    <span id="fakeBadge">模拟模式 Simulation</span>
   </header>
 
   <div id="menu"></div>
@@ -104,14 +114,14 @@
     <div id="stages"></div>
     <div id="distLine"></div>
     <div id="doneMark">🎉</div>
-    <button id="confirmBtn" class="bigBtn">我已取到饮料 ✓</button>
+    <button id="confirmBtn" class="bigBtn">我已取到饮料 ✓<span class="en">I've got my drink</span></button>
     <div id="failBox">
       <div id="failMsg"></div>
-      <button id="resetBtn">重置</button>
+      <button id="resetBtn">重置 Reset</button>
     </div>
   </div>
 
-  <button id="miniReset" title="紧急复位">复位</button>
+  <button id="miniReset" title="紧急复位 Emergency reset">复位 Reset</button>
   <div id="toast"></div>
 
 <script src="vendor.js"></script>
