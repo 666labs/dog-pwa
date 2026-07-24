@@ -45,10 +45,10 @@ FastAPI :8090（main.py + vendor.py，新增 CORS allow-all）
   ├─ /api/vendor/estop      ← 新：软停 + estopped 状态
   ├─ /api/vendor/estop/release
   ├─ /api/vendor/navlog     ← 新：tail /tmp/vendor-nav-leg.log
-  ├─ /api/camera/go2.mjpg|go2.jpg  ← 新：代理 localhost:8770（Go2 daemon）
-  └─ /api/camera/arm.mjpg|arm.jpg  ← 新：代理 localhost:8771（臂 daemon）
+  ├─ /api/camera/go2/stream.mjpg|snapshot.jpg|health ← 新：代理 localhost:8770
+  └─ /api/camera/arm/stream.mjpg|snapshot.jpg|health ← 新：代理 localhost:8772
         ├─ camera_daemon.py（已有，dimOS /color_image → MJPEG :8770）
-        └─ arm_camera_daemon.py（新，USB cam → MJPEG :8771）
+        └─ arm_camera_daemon.py（新，USB cam → MJPEG :8772；8771 已被 lidar daemon 占用）
 ```
 
 **为什么走代理**：隧道只暴露 8090 一个端口，浏览器无法直连 daemon 端口；LAN 页走代理同样工作（省一套分支逻辑）。前端自带"MJPEG 停帧 → 自动降级 2fps 快照轮询"兜底（隧道下长连接不稳时仍有画面）。
@@ -63,12 +63,12 @@ FastAPI :8090（main.py + vendor.py，新增 CORS allow-all）
   - `place_order` 在 `estopped` 时 409（错误码 `estopped`）。
   - `reset()` 不清除 estopped（急停语义强于复位；只有 release 能解除）。
 - 事件缓冲：`self.events: deque(maxlen=60)`，元素 `{seq, ts, key, zh, en, data}`。记录点：下单、臂取货开始/完成、导航启动（含目标坐标）、到达、等待取货、确认、返程、完成、失败（含原因）、急停、解除、复位。`_set()` 内嵌事件记录，减少散落调用。
-- status 响应新增：`events`（全量缓冲，1Hz 轮询体量可忽略）、`pose {x,y,yaw}`（nav_leg pose 事件回填；FAKE_DOG 模式合成直线插值）、`map {station, table, arrival_radius_m}`（来自 config，喂小地图）、`estopped` 布尔。
-- nav_leg stdout 读取处：`pose` 事件除 `dist` 外把 `x/y/yaw` 也写进 manager。
+- status 响应新增：`events`（全量缓冲，1Hz 轮询体量可忽略）、`pose {x,y}`（nav_leg pose 事件回填——该事件只有 x/y 没有 yaw，前端朝向由轨迹最后一段推算；FAKE_DOG 模式合成直线插值）、`map {station, table, arrival_radius_m}`（来自 config，喂小地图）、`estopped_at` 时间戳（估停判断直接看 `state === "estopped"`）。
+- nav_leg stdout 读取处：`pose` 事件除 `dist` 外把 `x/y` 也写进 manager。
 
 ### 4.2 arm_camera_daemon.py（新）
 
-- 参数：`--device`（默认 0）、`--port`（默认 8771）、`--width/--height/--fps/--quality`。
+- 参数：`--device`（默认 0）、`--port`（默认 8772，`--port 0` 由 OS 分配供测试）、`--width/--height/--fps/--quality`。
 - 从 `camera_daemon.py` 导入 `FrameHolder`、`_build_handler`、`_make_placeholder`（这三者不依赖 dimOS——仅 cv2/numpy/stdlib）。采集线程 `VideoCapture.read()` 循环 → JPEG → `holder.set_frame()`；相机打不开时持续供占位帧并按秒重试（拔插 USB 可自愈）。
 - stdout 单行 readiness JSON（沿用既有 daemon 协议）；SIGTERM 干净退出。
 - 解释器：优先 `DIMOS_PY`（conda，有 cv2），Mac 本地测试可用任何有 cv2 的解释器覆盖（`ARM_CAM_PY` 环境变量）。
@@ -76,13 +76,14 @@ FastAPI :8090（main.py + vendor.py，新增 CORS allow-all）
 ### 4.3 dimos_cli.py — 臂相机进程管理
 
 - 仿 `_CameraDaemon` 增加 `_ArmCameraDaemon`（懒启动、PID 跟踪、`arm_camera_ensure()`、stop 时不杀——臂相机与机器人连接无关，跟服务器生命周期走即可；`server shutdown` 时终止）。
-- `ARM_CAMERA_PORT = int(os.environ.get("ARM_CAMERA_PORT", "8771"))`。
+- `ARM_CAMERA_PORT = int(os.environ.get("ARM_CAMERA_PORT", "8772"))`；解释器 `ARM_CAM_PY`（默认 `DIMOS_PY`）。
+- 臂相机与机器人连接无关：run/stop/restart 不杀它，仅 `/api/server/shutdown` 时终止。
 
 ### 4.4 main.py — 代理路由 + CORS + navlog
 
 - `CORSMiddleware(allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])`。
-- `GET /api/camera/{cam}.mjpg`（cam ∈ go2|arm）：`StreamingResponse` 逐块转发 `localhost:<port>/stream.mjpg`（urllib，无新依赖；上游断开即结束响应）。go2 路径先走既有 `camera_ensure`，arm 路径走 `arm_camera_ensure`。
-- `GET /api/camera/{cam}.jpg`：单帧转发 `/snapshot.jpg`，`Cache-Control: no-store`。
+- `GET /api/camera/{cam}/stream.mjpg`（cam ∈ go2|arm）：`StreamingResponse` 逐块转发 `localhost:<port>/stream.mjpg`（urllib，无新依赖；上游断开即结束响应）。go2 路径先走既有 `camera_ensure`，arm 路径走 `arm_camera_ensure`。
+- `GET /api/camera/{cam}/snapshot.jpg`：单帧转发 `/snapshot.jpg`，`Cache-Control: no-store`。
 - `GET /api/camera/{cam}/health`：转发 daemon `/health`（前端画"画面活着"徽章用）。
 - `GET /api/vendor/navlog?lines=40`：tail 日志文件，文件不存在返回空数组。
 
@@ -109,7 +110,7 @@ FastAPI :8090（main.py + vendor.py，新增 CORS allow-all）
 │ 🤖 dimOS 饮料速递  [● LIVE/SIM/离线]   [🛑 急停] │
 ├────────────────┬───────────────────────────────┤
 │ 订单标题+阶段6格 │ [Go2 视角]  [机械臂工位]（16:9）  │
-│ 事件时间线       │ 遥测条: x·y·yaw·距目标·电量       │
+│ 事件时间线       │ 遥测条: x·y·速度·距目标·电量      │
 │ (滚动,新在上)    │ [小地图 canvas：站/桌/狗+轨迹]    │
 │                │ ▸ 导航日志（<details> 折叠）      │
 └────────────────┴───────────────────────────────┘
