@@ -41,7 +41,7 @@
   "pose_topic": "odom",
   "cancel_topic": "/tele_cmd_vel",
   "arm_stub_delay_s": 5.0,
-  "arrival_radius_m": 0.35,
+  "arrival_radius_m": 0.5,
   "nav_timeout_s": 90,
   "result_display_s": 6
 }

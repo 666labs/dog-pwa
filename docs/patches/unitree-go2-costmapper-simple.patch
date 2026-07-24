@@ -1,5 +1,5 @@
 --- /home/asus/dimos-env/lib/python3.12/site-packages/dimos/robot/unitree/go2/blueprints/smart/unitree_go2.py.orig-costmap	2026-07-24 19:42:01.152441297 +0000
-+++ /home/asus/dimos-env/lib/python3.12/site-packages/dimos/robot/unitree/go2/blueprints/smart/unitree_go2.py	2026-07-24 19:47:05.112510480 +0000
++++ /home/asus/dimos-env/lib/python3.12/site-packages/dimos/robot/unitree/go2/blueprints/smart/unitree_go2.py	2026-07-24 20:00:53.066884663 +0000
 @@ -19,6 +19,7 @@
  from dimos.core.stream import In
  from dimos.core.transport import LCMTransport
@@ -8,11 +8,13 @@
  from dimos.mapping.relocalization.module import RelocalizationModule
  from dimos.mapping.voxels import VoxelGridMapper
  from dimos.memory2.module import Recorder, RecorderConfig, pose_setter_for
-@@ -41,12 +42,20 @@
+@@ -40,13 +41,21 @@
+ 
  unitree_go2 = autoconnect(
      unitree_go2_basic,
-     VoxelGridMapper.blueprint(emit_every=5),
+-    VoxelGridMapper.blueprint(emit_every=5),
 -    CostMapper.blueprint(),
++    VoxelGridMapper.blueprint(emit_every=2),
 +    # PATCHED (AdventureX 2026-07-25): default height_cost algo makes obstacles
 +    # taller than can_pass_under=0.6m (walls, people, tall boxes) invisible and
 +    # keeps thin legs below the lethal threshold -> robot plows into them.
@@ -27,7 +29,7 @@
      PatrollingModule.blueprint(),
      MovementManager.blueprint(),
 -).global_config(n_workers=10, robot_model="unitree_go2")
-+).global_config(n_workers=10, robot_model="unitree_go2", nerf_speed=0.6)
++).global_config(n_workers=10, robot_model="unitree_go2", nerf_speed=0.6, robot_width=0.5)
  
  
  class Go2MemoryConfig(RecorderConfig):

@@ -1,0 +1,11 @@
+--- /home/asus/dimos-env/lib/python3.12/site-packages/dimos/navigation/replanning_a_star/global_planner.py.orig-clearance	2026-07-24 20:00:53.047979720 +0000
++++ /home/asus/dimos-env/lib/python3.12/site-packages/dimos/navigation/replanning_a_star/global_planner.py	2026-07-24 20:00:53.066675127 +0000
+@@ -348,7 +348,7 @@
+ 
+     def _find_wide_path(self, goal: Vector3, robot_pos: Vector3) -> Path | None:
+         #        sizes_to_try: list[float] = [2.2, 1.7, 1.3, 1]
+-        sizes_to_try: list[float] = [1.1]
++        sizes_to_try: list[float] = [2.2, 1.7, 1.3, 1.1]
+ 
+         for size in sizes_to_try:
+             distance = robot_pos.distance(goal)

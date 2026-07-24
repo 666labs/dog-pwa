@@ -1,40 +1,51 @@
 #!/usr/bin/env python3
-"""Apply the CostMapper obstacle-visibility fix to an installed dimos package.
+"""Apply the Go2 navigation fixes to an installed dimos package (idempotent).
 
-Why: the stock `unitree-go2` blueprint runs CostMapper with the default
-`height_cost` (terrain-slope) algorithm. Its `can_pass_under=0.6` heuristic
-treats any grid cell containing both floor points and points >0.6m up as
-"robot can pass underneath" and takes the floor height, so walls, tall boxes
-and standing people produce ZERO cost — the planner drives straight through
-them. Its gaussian smoothing also keeps thin obstacles (chair legs: max 75)
-below the lethal threshold (100) that both path inflation and the local
-planner's `is_obstacle_ahead()` check require. Verified empirically with
-synthetic scenes on dimos 0.0.14b1 (see docs/patches/README.md).
+Round 1 — obstacle visibility (see README.md "costmapper-simple"):
+  CostMapper height_cost -> simple absolute z-band (0.15-2.0m lethal).
+  Stock behavior made walls/people/tall boxes invisible (cost 0) and thin
+  obstacles sub-lethal, so the robot plowed straight into them.
 
-Fix: switch CostMapper to the `simple` absolute-height-band algorithm —
-every point 0.15–2.0m above ground marks its cell lethal (100).
+Round 2 — clearance (see README.md "clearance"):
+  In the venue only a narrow scanned corridor is known-free; A* pays 80/cell
+  for UNKNOWN so it hugs the inflation boundary instead of taking a berth
+  through unscanned space. Stock inflation (robot_width 0.3 x 1.1 / 2 =
+  0.165m) < the Go2's 0.35m body-sweep radius -> guaranteed grazes.
+  Measured in a corridor repro: stock clearance 0.35m (graze), fixed 0.55m.
+    - robot_width 0.3 -> 0.5 (inflation 0.165 -> 0.275m at the 1.1x floor,
+      wider is_obstacle_ahead path mask)
+    - restore GlobalPlanner._find_wide_path wide-first size ladder
+      [1.1] -> [2.2, 1.7, 1.3, 1.1] (0.55m berth when space allows)
+    - VoxelGridMapper emit_every 5 -> 2 (fresh obstacles mapped sooner)
+    - nerf_speed=0.6 (0.55 -> 0.33 m/s, requested demo pacing)
+
+Companion (not in this script): backend/vendor_config.json arrival_radius_m
+0.35 -> 0.5, so safe-goal displacement near tables doesn't false-timeout the
+nav leg.
 
 Usage (on the machine whose dimos install should be patched):
     <dimos-env>/bin/python3 apply_costmapper_patch.py
 
-Idempotent: refuses to double-apply. Original backed up as
-`unitree_go2.py.orig-costmap` next to the target; restore it to roll back.
+Backups written next to the originals: unitree_go2.py.orig-costmap,
+global_planner.py.orig-clearance — restore them to roll back.
 """
 import shutil
 import sys
 
 try:
-    import dimos.robot.unitree.go2.blueprints.smart.unitree_go2 as target_mod
+    import dimos.navigation.replanning_a_star.global_planner as gp_mod
+    import dimos.robot.unitree.go2.blueprints.smart.unitree_go2 as bp_mod
 except ImportError as e:
     sys.exit(f"cannot import dimos (run with the dimos env's python): {e}")
 
-PATH = target_mod.__file__
+BP_PATH = bp_mod.__file__
+GP_PATH = gp_mod.__file__
 
 OLD_IMPORT = "from dimos.mapping.costmapper import CostMapper\n"
 NEW_IMPORT = OLD_IMPORT + "from dimos.mapping.pointclouds.occupancy import SimpleOccupancyConfig\n"
 
-OLD_LINE = "    CostMapper.blueprint(),\n"
-NEW_LINE = (
+OLD_COSTMAPPER = "    CostMapper.blueprint(),\n"
+NEW_COSTMAPPER = (
     "    # PATCHED (AdventureX 2026-07-25): default height_cost algo makes obstacles\n"
     "    # taller than can_pass_under=0.6m (walls, people, tall boxes) invisible and\n"
     "    # keeps thin legs below the lethal threshold -> robot plows into them.\n"
@@ -46,22 +57,41 @@ NEW_LINE = (
     "    ),\n"
 )
 
-# Demo pacing: nerf_speed multiplies the local planner's 0.55 m/s cruise speed
-# (0.6 -> ~0.33 m/s), requested for supervised venue runs.
+OLD_VOXEL = "    VoxelGridMapper.blueprint(emit_every=5),\n"
+NEW_VOXEL = "    VoxelGridMapper.blueprint(emit_every=2),\n"
+
 OLD_GC = ').global_config(n_workers=10, robot_model="unitree_go2")'
-NEW_GC = ').global_config(n_workers=10, robot_model="unitree_go2", nerf_speed=0.6)'
+NEW_GC = ').global_config(n_workers=10, robot_model="unitree_go2", nerf_speed=0.6, robot_width=0.5)'
 
-src = open(PATH).read()
+OLD_SIZES = "        sizes_to_try: list[float] = [1.1]\n"
+NEW_SIZES = "        sizes_to_try: list[float] = [2.2, 1.7, 1.3, 1.1]\n"
 
-if "SimpleOccupancyConfig" in src:
-    sys.exit(f"already patched: {PATH}")
-if src.count(OLD_IMPORT) != 1 or src.count(OLD_LINE) != 1 or src.count(OLD_GC) != 1:
-    sys.exit(f"anchors not found — dimos version drift? inspect {PATH} manually")
 
-shutil.copy2(PATH, PATH + ".orig-costmap")
-patched = (
-    src.replace(OLD_IMPORT, NEW_IMPORT).replace(OLD_LINE, NEW_LINE).replace(OLD_GC, NEW_GC)
+def patch_file(path, backup_suffix, replacements, marker):
+    src = open(path).read()
+    if marker in src:
+        print(f"already patched: {path}")
+        return
+    for old, _ in replacements:
+        if src.count(old) != 1:
+            sys.exit(f"anchor not found ({old!r:.60}) — dimos version drift? inspect {path}")
+    shutil.copy2(path, path + backup_suffix)
+    for old, new in replacements:
+        src = src.replace(old, new)
+    open(path, "w").write(src)
+    print(f"patched OK: {path}  (backup: {path}{backup_suffix})")
+
+
+patch_file(
+    BP_PATH,
+    ".orig-costmap",
+    [(OLD_IMPORT, NEW_IMPORT), (OLD_COSTMAPPER, NEW_COSTMAPPER),
+     (OLD_VOXEL, NEW_VOXEL), (OLD_GC, NEW_GC)],
+    marker="SimpleOccupancyConfig",
 )
-open(PATH, "w").write(patched)
-print(f"patched OK: {PATH}")
-print(f"backup:     {PATH}.orig-costmap")
+patch_file(
+    GP_PATH,
+    ".orig-clearance",
+    [(OLD_SIZES, NEW_SIZES)],
+    marker="[2.2, 1.7, 1.3, 1.1]",
+)

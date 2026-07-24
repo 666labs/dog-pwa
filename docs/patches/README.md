@@ -62,11 +62,48 @@ F=~/dimos-env/lib/python3.12/site-packages/dimos/robot/unitree/go2/blueprints/sm
 cp "$F.orig-costmap" "$F"
 ```
 
-**Files:**
-- `unitree-go2-costmapper-simple.patch` — the exact diff applied
-- `apply_costmapper_patch.py` — idempotent applier (survives reinstall)
-- `costmap_repro.py` — synthetic-scene evidence script (`~/dimos-env/bin/python3 costmap_repro.py`)
+## unitree-go2-clearance (2026-07-25, round 2)
 
-**Not changed:** link-stability (WebRTC drops mid-run, no auto-reconnect
-watchdog) is a separate known issue — this patch only fixes obstacle
-visibility.
+**Symptom:** with round 1 applied, a supervised run passed nearly touching an
+obstacle ("almost knocked it over").
+
+**Root cause** (reproduced offline in a corridor scene): in the venue only the
+narrow strip the robot has scanned is known-free; everything else is UNKNOWN,
+which A* prices at 80/cell. The cheapest route past an obstacle is therefore
+the known sliver hugging the inflation boundary. Stock inflation is
+`robot_width 0.3 x 1.1 / 2 = 0.165m` — less than the Go2's ~0.35m body-sweep
+radius (0.70m long body), so a planned "pass" is a physical graze. The
+wide-berth ladder in `GlobalPlanner._find_wide_path` that would have preferred
+more clearance is commented down to `[1.1]` in dimos 0.0.14b1.
+
+Measured (corridor scene, min path-to-obstacle distance; body sweep = 0.35m):
+
+| config                              | clearance | verdict     |
+|-------------------------------------|-----------|-------------|
+| stock (width 0.3, sizes [1.1])      | 0.35m     | graze       |
+| fixed (width 0.5, sizes [2.2…1.1])  | 0.55m     | ~0.2m margin|
+
+Open-world and 1.2m-gap scenes stay passable (the ladder falls back to
+narrower inflation only when needed). Repro: `clearance_test.py`.
+
+**Fix (all in the same two patched files):**
+- `robot_width` 0.3 → 0.5 via blueprint `global_config` (harder inflation,
+  wider `is_obstacle_ahead` mask)
+- `_find_wide_path` sizes `[1.1]` → `[2.2, 1.7, 1.3, 1.1]`
+- `VoxelGridMapper` `emit_every` 5 → 2 (costmap integrates fresh obstacles
+  ~2.5x sooner while walking)
+- `nerf_speed=0.6` (0.55 → 0.33 m/s cruise, requested demo pacing)
+- companion: `backend/vendor_config.json` `arrival_radius_m` 0.35 → 0.5
+  (safe-goal displacement near tables must not false-timeout the nav leg)
+
+**Files:**
+- `unitree-go2-costmapper-simple.patch` — full diff of the blueprint file (rounds 1+2)
+- `replanning-astar-wide-sizes.patch` — diff of global_planner.py (round 2)
+- `apply_costmapper_patch.py` — idempotent applier for both files (survives reinstall)
+- `costmap_repro.py` — round-1 evidence script
+- `clearance_test.py` — round-2 evidence script
+
+**Not changed:** link-stability (WebRTC drops mid-run ~30-90s into navigation,
+`accept_track` callback error, no auto-reconnect watchdog) is a separate known
+issue — it killed both supervised runs short of the goal and remains the top
+demo risk.
