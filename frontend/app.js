@@ -13,6 +13,20 @@ const state = {
   running: false,     // a dimOS run is active
 };
 
+// --- Robot-link truth -------------------------------------------------------
+// "A run is active" (a devbox process exists) says NOTHING about the robot:
+// with the robot powered off the run process keeps retrying, cached RPC values
+// (battery) still answer, and our own /cmd_vel publishes still flow. So the
+// topbar pill keys off CONFIRMED robot-origin data only: a parsed nonzero rate
+// on a robot topic, a fresh camera frame, or a fresh pose. Each poll calls
+// noteRobotData() when — and only when — it sees the real thing.
+const ROBOT_TOPICS = ["/odom", "/color_image", "/camera_info", "/lidar"]; // robot-origin only; /cmd_vel is our own traffic
+const ROBOT_FRESH_MS = 25000;  // > one full telemetry cycle (8s poll + 5s spy) with slack
+let lastRobotDataTs = 0;
+let warmedPid = null;          // run PID the daemons were last warmed for
+function noteRobotData() { lastRobotDataTs = Date.now(); }
+function robotLinkFresh() { return lastRobotDataTs > 0 && Date.now() - lastRobotDataTs < ROBOT_FRESH_MS; }
+
 // --------------------------------------------------------------------------- helpers
 async function apiGet(path) {
   const r = await fetch(path);
@@ -224,15 +238,20 @@ async function doConnect() {
       const chk = await apiGet("/api/connection-check?topic=/odom&seconds=4");
       const all = chk.all_topics || {};
       $("connect-evidence").innerHTML = CORE.map((t) => {
-        const a = all[t] && all[t].alive;
-        return `<div class="tile" style="border-color:${a ? "var(--green)" : "var(--dim)"}"><div class="t-label">${esc(t)}</div>` +
-          `<div class="t-val" style="color:${a ? "var(--green)" : "var(--dim-2)"};font-size:13px">${a ? "&#9679;" : "&#9675;"}</div></div>`;
+        const info = all[t] || {};
+        const confirmed = !!info.alive && !info.indeterminate;  // parsed rate — real data
+        const maybe = !!info.alive && !!info.indeterminate;     // name-seen only — not proof
+        const col = confirmed ? "var(--green)" : maybe ? "var(--yellow)" : "var(--dim-2)";
+        const border = confirmed ? "var(--green)" : maybe ? "var(--yellow)" : "var(--dim)";
+        return `<div class="tile" style="border-color:${border}"><div class="t-label">${esc(t)}</div>` +
+          `<div class="t-val" style="color:${col};font-size:13px">${confirmed ? "&#9679;" : maybe ? "&#9684;" : "&#9675;"}</div></div>`;
       }).join("");
       if (chk.live) live = true;
     } catch (e) { /* keep polling */ }
   }
   if (live) {
     state.connected = true;
+    noteRobotData();   // step C just confirmed real robot telemetry
     setStep("step-c", "done", "live");
     msg.className = "msg ok"; msg.textContent = "robot is live. Dashboard unlocked.";
     enableDashboard();
@@ -267,8 +286,28 @@ async function pollStatus() {
   try {
     const st = await apiGet("/api/status");
     state.running = st.running;
-    setPill($("conn-pill"), st.running ? "run active" : "connected", st.running ? "run" : "ok");
     if (st.running) {
+      // Fresh PID = the backend killed + will respawn all daemons for this
+      // run, so the warm guards and robot-data freshness reset with it. This
+      // catches restart / stop-and-replace, where `running` never blips false
+      // between polls — the old once-per-run guard missed those, leaving the
+      // first press after a restart to pay the full ~1.5-2s daemon spawn.
+      if (st.pid !== warmedPid) {
+        warmedPid = st.pid;
+        teleopWarmed = false;
+        sportWarmed = false;
+        lastRobotDataTs = 0;
+      }
+      // Pill reports the ROBOT link, never bare process existence (the old
+      // "run active"/"connected" wording showed green with the robot off).
+      if (robotLinkFresh()) setPill($("conn-pill"), "robot live", "ok");
+      else if (lastRobotDataTs) setPill($("conn-pill"), `no robot data ${Math.round((Date.now() - lastRobotDataTs) / 1000)}s`, "warn");
+      else setPill($("conn-pill"), "run up — no robot data yet", "warn");
+      // Teleop/sport must publish on the RUN's transport — a mismatched manual
+      // pick publishes into a bus the robot never reads (acked ok, no motion).
+      const trSel = $("teleop-transport");
+      const runTr = st.transport || "";
+      if (trSel && trSel.value !== runTr) trSel.value = runTr;
       enableDashboard();
       body.innerHTML = `<div class="big-state run">running</div>
         <dl class="kv">
@@ -283,10 +322,13 @@ async function pollStatus() {
       maybeWarmTeleop();
       maybeWarmSport();
     } else {
+      setPill($("conn-pill"), "idle — no run", "");
       body.innerHTML = `<div class="big-state idle">idle</div><p class="muted">No running dimOS instance.</p>`;
       $("btn-stop").disabled = true; $("btn-restart").disabled = true;
+      warmedPid = null;
       teleopWarmed = false;   // run ended — next run re-warms a fresh daemon
       sportWarmed = false;
+      lastRobotDataTs = 0;    // stale robot data must not carry into a future run
       setBattery(null);
     }
   } catch (e) {
@@ -391,12 +433,18 @@ async function checkTopicRate() {
   try {
     const q = "/api/topic-rate?name=" + encodeURIComponent(name) + "&seconds=5" + (tr ? "&transport=" + encodeURIComponent(tr) : "");
     const d = await apiGet(q);
-    if (d.alive) {
+    if (d.alive && !d.indeterminate) {
       setPill($("topic-status"), "alive", "run");
       res.innerHTML = `<div class="tiles"><div class="tile" style="border-color:var(--green)">
         <div class="t-label">${esc(d.topic)}</div>
         <div class="t-val" style="color:var(--green);font-size:15px">&#9679; alive</div>
         <div class="muted" style="font-size:11px">${esc(d.sample || "publishing")}</div></div></div>`;
+    } else if (d.alive) {
+      setPill($("topic-status"), "listed?", "warn");
+      res.innerHTML = `<div class="tiles"><div class="tile" style="border-color:var(--yellow)">
+        <div class="t-label">${esc(d.topic)}</div>
+        <div class="t-val" style="color:var(--yellow);font-size:15px">&#9684; listed — rate unknown</div>
+        <div class="muted" style="font-size:11px">name seen in spy but no parsed rate — may be a stale/0Hz row, not proof of traffic</div></div></div>`;
     } else {
       setPill($("topic-status"), "silent", "warn");
       res.innerHTML = `<div class="tiles"><div class="tile">
@@ -425,11 +473,21 @@ function renderTelemetryGrid(topics, now) {
   const grid = $("telemetry-grid");
   grid.innerHTML = TELEMETRY_TOPICS.map((t) => {
     const info = topics[t] || { alive: false };
-    const alive = !!info.alive;
-    return `<div class="tile" style="border-color:${alive ? "var(--green)" : "var(--dim)"}">
+    // Three states, not two: a confirmed (parsed) rate is green; a name-only
+    // spy sighting (`indeterminate` — can be a stale/0Hz row while the robot
+    // is off) is amber, never green; anything else is dead.
+    const confirmed = !!info.alive && !info.indeterminate;
+    const maybe = !!info.alive && !!info.indeterminate;
+    const color = confirmed ? "var(--green)" : maybe ? "var(--yellow)" : "var(--dim-2)";
+    const border = confirmed ? "var(--green)" : maybe ? "var(--yellow)" : "var(--dim)";
+    const val = confirmed ? "&#9679; alive" : maybe ? "&#9684; listed?" : "&#9675; dead";
+    const sub = confirmed ? esc(info.sample || "publishing")
+      : maybe ? "in spy table, rate unparsed — not proof of data"
+      : esc(staleLabel(t, now));
+    return `<div class="tile" style="border-color:${border}">
       <div class="t-label">${esc(t)}</div>
-      <div class="t-val" style="color:${alive ? "var(--green)" : "var(--dim-2)"};font-size:14px">${alive ? "&#9679; alive" : "&#9675; dead"}</div>
-      <div class="muted" style="font-size:10px">${alive ? esc(info.sample || "publishing") : esc(staleLabel(t, now))}</div></div>`;
+      <div class="t-val" style="color:${color};font-size:14px">${val}</div>
+      <div class="muted" style="font-size:10px">${sub}</div></div>`;
   }).join("");
 }
 // ---- Pose (x/y/yaw) — real values via /api/pose (backed by lidar_daemon.py's
@@ -459,6 +517,7 @@ async function pollPose() {
       hint.textContent = "pose daemon up; waiting for /odom to start publishing (this connection is intermittent).";
       return;
     }
+    if (r.fresh) noteRobotData();   // fresh pose = confirmed robot-origin data
     setPoseTile("pose-x", r.x, 2);
     setPoseTile("pose-y", r.y, 2);
     setPoseTile("pose-yaw", r.yaw * 180 / Math.PI, 1);
@@ -480,7 +539,12 @@ async function pollTelemetry() {
     const r = await apiGet("/api/telemetry?seconds=5");
     const topics = r.topics || {};
     const now = Date.now();
-    for (const t of TELEMETRY_TOPICS) if (topics[t] && topics[t].alive) telemetryLastSeen[t] = now;
+    for (const t of TELEMETRY_TOPICS) {
+      const info = topics[t];
+      if (!info || !info.alive || info.indeterminate) continue;  // confirmed rate only
+      telemetryLastSeen[t] = now;
+      if (ROBOT_TOPICS.includes(t)) noteRobotData();
+    }
     renderTelemetryGrid(topics, now);
   } catch (e) {
     $("telemetry-grid").innerHTML = `<p class="msg err">${esc(e.message)}</p>`;
@@ -530,14 +594,26 @@ async function maybeWarmTeleop() {
   try { await apiPostForm("/api/teleop/warm", { topic, transport }); }
   catch (e) { teleopWarmed = false; }   // let a later poll retry on failure
 }
-async function sendTwist(vec) {
-  const { topic, transport } = teleopParams();
-  const fields = { lx: 0, ly: 0, lz: 0, ax: 0, ay: 0, az: 0, topic, transport, ...vec };
-  const { ok, data } = await apiPostForm("/api/teleop", fields);
-  const msg = $("msg-teleop");
-  if (!ok) { msg.className = "msg err"; msg.textContent = (data.detail || data.stderr || "send failed").slice(0, 120); }
-  else if (data.ok === false) { msg.className = "msg err"; msg.textContent = (data.stderr || data.stdout || "send error").slice(0, 120); }
-  else { msg.className = "msg"; msg.textContent = ""; }
+let twistInFlight = false;
+async function sendTwist(vec, force) {
+  // At sub-ms daemon sends the 150ms repeat never overlaps itself — but when
+  // the daemon is cold/respawning (~1.5-2s) every tick used to stack up behind
+  // its lock, and a queued move could land AFTER the release-zero (motion
+  // after release). Skip repeats while one send is pending; the stop path
+  // passes force so the zero Twist is never skipped.
+  if (twistInFlight && !force) return;
+  twistInFlight = true;
+  try {
+    const { topic, transport } = teleopParams();
+    const fields = { lx: 0, ly: 0, lz: 0, ax: 0, ay: 0, az: 0, topic, transport, ...vec };
+    const { ok, data } = await apiPostForm("/api/teleop", fields);
+    const msg = $("msg-teleop");
+    if (!ok) { msg.className = "msg err"; msg.textContent = (data.detail || data.stderr || "send failed").slice(0, 120); }
+    else if (data.ok === false) { msg.className = "msg err"; msg.textContent = (data.stderr || data.stdout || "send error").slice(0, 120); }
+    else { msg.className = "msg"; msg.textContent = ""; }
+  } finally {
+    twistInFlight = false;
+  }
 }
 function startDir(dir, btn) {
   if (teleopActive) stopDir();
@@ -556,7 +632,7 @@ function stopDir() {
   teleopToken++;   // invalidate any in-flight timer tick immediately
   teleopActive = null;
   document.querySelectorAll(".dpad .tbtn.pressed").forEach((b) => b.classList.remove("pressed"));
-  sendTwist({});  // zero velocity — the actual stop; release must always fire this
+  sendTwist({}, true);  // zero velocity — the actual stop; must never be skipped by the in-flight guard
 }
 async function eStop() {
   if (teleopTimer) { clearInterval(teleopTimer); teleopTimer = null; }
@@ -606,6 +682,7 @@ async function loadCamera() {
         Launch <b>unitree-go2-basic</b>; the live image appears here once the camera daemon is up.</p>`;
       return;
     }
+    if (r.has_frame && r.fresh) noteRobotData();   // fresh frame = confirmed robot-origin data
     const src = `http://${HOST}:${r.port}${r.path}`;
     // Only (re)build the <img> when the src changes, so polling never reloads
     // (and restarts) the ongoing MJPEG stream.
@@ -1053,9 +1130,17 @@ async function doSportStatus(spec) {
 }
 
 // Battery (GO2Connection/battery_soc — works even while the command channel is down)
-function setBattery(pct) {
+function setBattery(pct, stale) {
   const b = $("battery-badge");
   if (pct === null || pct === undefined) { b.textContent = "battery ?"; b.className = "pill"; return; }
+  if (stale) {
+    // battery_soc answers from the LOCAL connection module's cache, so a
+    // number keeps coming back with the robot off — say so instead of
+    // wearing live colors.
+    b.textContent = `battery ${pct}% (cached)`;
+    b.className = "pill";
+    return;
+  }
   b.textContent = `battery ${pct}%`;
   b.className = "pill " + (pct > 40 ? "bat-ok" : pct > 15 ? "bat-low" : "bat-crit");
 }
@@ -1063,7 +1148,7 @@ async function pollBattery() {
   if (!state.running || $("view-dashboard").hidden) { setBattery(null); return; }
   try {
     const d = await apiGet("/api/battery");
-    setBattery(d.ok && typeof d.result === "number" ? d.result : null);
+    setBattery(d.ok && typeof d.result === "number" ? d.result : null, !robotLinkFresh());
   } catch (e) { setBattery(null); }
 }
 

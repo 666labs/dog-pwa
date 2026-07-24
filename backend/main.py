@@ -38,6 +38,23 @@ CAMERA_PORT = 5555
 app = FastAPI(title="dimOS Control")
 
 
+def _effective_transport(tr: Optional[str]) -> Optional[str]:
+    """Default a client-omitted transport to the CURRENT RUN's transport.
+
+    Teleop/sport publishes and spy snapshots only work on the bus the running
+    blueprint actually uses. The UI has a separate transport selector from the
+    launcher's, so a zenoh-launched run + untouched "default (LCM)" teleop
+    selector silently published into a bus the robot never reads — every send
+    acked ok:true with zero motion (one of the observed "command does not
+    react" cases). An explicit client value still wins (validated by each
+    endpoint before calling this); omitted/empty now means "match the run"."""
+    if tr:
+        return tr
+    st = dimos_cli.status()
+    t = st.get("transport") if st.get("running") else None
+    return str(t) if t else None
+
+
 # --------------------------------------------------------------------------- #
 # API
 # --------------------------------------------------------------------------- #
@@ -573,13 +590,23 @@ def api_connection_check(topic: str = "/odom", seconds: float = 6.0,
 
     req_topic = (topic or "/odom").strip()
     topics_to_check = list(dict.fromkeys([req_topic, *_GO2_TELEMETRY_TOPICS]))  # dedupe, keep order
-    result = dimos_cli.any_topic_alive(topics_to_check, seconds=seconds, transport=tr)
+    result = dimos_cli.any_topic_alive(topics_to_check, seconds=seconds,
+                                       transport=_effective_transport(tr))
 
+    # `live` = confirmed robot-origin telemetry ONLY (parsed nonzero rate).
+    # The old check also counted cam.available — but that probes
+    # localhost:5555, a web server run by the LOCAL dimOS process (any
+    # blueprint with RobotWebInterface, even another panel's run on this box),
+    # which stays up with the robot off — so it can't prove the robot is live.
+    # Camera info is still reported for display. /cmd_vel is excluded for the
+    # same reason: it's our own teleop/prime traffic.
+    live = dimos_cli._strict_alive(
+        {t: v for t, v in result["topics"].items() if t != "/cmd_vel"})
     return {
         "camera": cam,
         "topic_check": {"topic": req_topic, **result["topics"].get(req_topic, {"alive": False, "sample": None})},
         "all_topics": result["topics"],
-        "live": bool(cam.get("available")) or bool(result["alive"]),
+        "live": live,
     }
 
 
@@ -599,7 +626,8 @@ def api_teleop(lx: float = Form(0.0), ly: float = Form(0.0), lz: float = Form(0.
     tr = (transport or "").strip().lower() or None
     if tr not in (None, "lcm", "zenoh"):
         raise HTTPException(status_code=400, detail="transport must be lcm or zenoh")
-    return dimos_cli.teleop_send(lx, ly, lz, ax, ay, az, topic=topic, transport=tr)
+    return dimos_cli.teleop_send(lx, ly, lz, ax, ay, az, topic=topic,
+                                 transport=_effective_transport(tr))
 
 
 @app.post("/api/teleop/stop")
@@ -612,6 +640,7 @@ def api_teleop_stop(topic: str = Form("/cmd_vel"),
     tr = (transport or "").strip().lower() or None
     if tr not in (None, "lcm", "zenoh"):
         raise HTTPException(status_code=400, detail="transport must be lcm or zenoh")
+    tr = _effective_transport(tr)
     res = dimos_cli.teleop_send(0, 0, 0, 0, 0, 0, topic=topic, transport=tr)
     if not res.get("ok"):
         # Safety fallback: the slow-but-reliable CLI path.
@@ -632,7 +661,7 @@ def api_teleop_warm(topic: str = Form("/cmd_vel"),
     tr = (transport or "").strip().lower() or None
     if tr not in (None, "lcm", "zenoh"):
         raise HTTPException(status_code=400, detail="transport must be lcm or zenoh")
-    res = dimos_cli.teleop_warm(topic=topic, transport=tr)
+    res = dimos_cli.teleop_warm(topic=topic, transport=_effective_transport(tr))
     res["daemon"] = dimos_cli.teleop_status()
     return res
 
@@ -683,7 +712,8 @@ def api_sport(method: str = Form(...),
     # methods here (standup/liedown/balance_stand/stop_movement/battery_soc)
     # are fast utility calls and keep the daemon's normal default.
     call_timeout = 25.0 if method == "sport_command" else None
-    return dimos_cli.sport_call(method, args, transport=tr, timeout=call_timeout)
+    return dimos_cli.sport_call(method, args, transport=_effective_transport(tr),
+                                timeout=call_timeout)
 
 
 @app.post("/api/sport-status")
@@ -699,7 +729,7 @@ def api_sport_status(arg: int = Form(...), transport: Optional[str] = Form(None)
     tr = (transport or "").strip().lower() or None
     if tr not in (None, "lcm", "zenoh"):
         raise HTTPException(status_code=400, detail="transport must be lcm or zenoh")
-    return dimos_cli.sport_command_status(int(arg), transport=tr)
+    return dimos_cli.sport_command_status(int(arg), transport=_effective_transport(tr))
 
 
 @app.post("/api/sport/warm")
@@ -709,7 +739,7 @@ def api_sport_warm(transport: Optional[str] = Form(None)):
     tr = (transport or "").strip().lower() or None
     if tr not in (None, "lcm", "zenoh"):
         raise HTTPException(status_code=400, detail="transport must be lcm or zenoh")
-    res = dimos_cli.sport_warm(transport=tr)
+    res = dimos_cli.sport_warm(transport=_effective_transport(tr))
     res["daemon"] = dimos_cli.sport_status()
     return res
 
@@ -721,7 +751,8 @@ def api_battery(transport: Optional[str] = None):
     tr = (transport or "").strip().lower() or None
     if tr not in (None, "lcm", "zenoh"):
         raise HTTPException(status_code=400, detail="transport must be lcm or zenoh")
-    return dimos_cli.sport_call("battery_soc", [], transport=tr, timeout=5)
+    return dimos_cli.sport_call("battery_soc", [], transport=_effective_transport(tr),
+                                timeout=5)
 
 
 # --------------------------------------------------------------------------- #
@@ -744,7 +775,14 @@ def api_telemetry(seconds: float = 5.0, transport: Optional[str] = None):
     tr = (transport or "").strip().lower() or None
     if tr not in (None, "lcm", "zenoh"):
         raise HTTPException(status_code=400, detail="transport must be lcm or zenoh")
-    return dimos_cli.any_topic_alive(_SENSOR_TOPICS, seconds=seconds, transport=tr)
+    res = dimos_cli.any_topic_alive(_SENSOR_TOPICS, seconds=seconds,
+                                    transport=_effective_transport(tr))
+    # /cmd_vel is OUR OWN traffic (teleop presses + the warm-prime zero Twist)
+    # — it proves nothing about the robot, so it must not make the aggregate
+    # read "alive" while the robot is off. Its tile stays in `topics`.
+    res["alive"] = dimos_cli._strict_alive(
+        {t: v for t, v in res["topics"].items() if t != "/cmd_vel"})
+    return res
 
 
 @app.get("/api/topic-rate")
@@ -758,7 +796,8 @@ def api_topic_rate(name: str, seconds: float = 5.0, transport: Optional[str] = N
     tr = (transport or "").strip().lower() or None
     if tr not in (None, "lcm", "zenoh"):
         raise HTTPException(status_code=400, detail="transport must be lcm or zenoh")
-    return dimos_cli.topic_alive(name, seconds=seconds, transport=tr)
+    return dimos_cli.topic_alive(name, seconds=seconds,
+                                 transport=_effective_transport(tr))
 
 
 @app.get("/api/health")
