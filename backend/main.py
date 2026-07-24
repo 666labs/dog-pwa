@@ -154,6 +154,8 @@ def _delayed_self_terminate():
     # process dies, then a plain SIGTERM (uvicorn's own graceful-shutdown
     # handler) rather than SIGKILL — same as Ctrl-C in a terminal.
     time.sleep(0.4)
+    # 臂相机 daemon 与机器人连接无关（run/stop 不管它），跟服务器生命周期走。
+    dimos_cli.arm_camera_kill()
     os.kill(os.getpid(), signal.SIGTERM)
 
 
