@@ -767,6 +767,19 @@ def api_health():
 
 
 # --------------------------------------------------------------------------- #
+# Vendor demo (drink ordering → arm stub → Go2 nav delivery)
+# --------------------------------------------------------------------------- #
+import vendor  # noqa: E402  (after app setup, before the catch-all static mount)
+
+app.include_router(vendor.router)
+
+
+@app.get("/vendor")
+def vendor_page():
+    return FileResponse(os.path.join(FRONTEND_DIR, "vendor.html"))
+
+
+# --------------------------------------------------------------------------- #
 # Static frontend (mounted last so /api/* wins). "/" serves index.html.
 # --------------------------------------------------------------------------- #
 @app.get("/")
