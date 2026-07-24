@@ -31,7 +31,7 @@ vendor 编排器（backend/vendor.py，挂载进 main.py 的 FastAPI app）
    │
    ├─ 阶段1: ArmExecutor.pick(drink)      ← 本次为 stub（configurable delay + 日志）
    ├─ 阶段2: DogExecutor.go_to(table)     ← 确保 nav blueprint 运行
-   │           → nav_daemon 发布目标位姿 (x, y, yaw)
+   │           → nav_leg 子进程发布目标点 (x, y) 到 /clicked_point
    │           → 轮询里程计，距目标 < arrival_radius 判定到达
    │           → 超时（nav_timeout_s）判定失败
    ├─ 阶段3: 暂停等待顾客 POST /api/vendor/confirm（「确认取货」按钮，无超时）
@@ -40,7 +40,7 @@ vendor 编排器（backend/vendor.py，挂载进 main.py 的 FastAPI app）
 GET /api/vendor/status ← 前端 1 Hz 轮询（与现有面板轮询风格一致）
 ```
 
-不新增进程、不新增端口。`nav_daemon.py` 仿照现有 `teleop_daemon.py` / `sport_daemon.py` 的 warm-daemon 模式：由 `dimos_cli.py` 按需拉起、保持热连接，每次目标下发 < 1 ms。
+不新增常驻进程、不新增端口。`nav_leg.py` 是每条导航腿一个的短生命周期子进程（见 §4.2 修订），由 `vendor.py` 直接 spawn/回收。
 
 ## 4. 组件
 
@@ -50,11 +50,17 @@ GET /api/vendor/status ← 前端 1 Hz 轮询（与现有面板轮询风格一�
 - **ArmExecutor（stub）**：`async def pick(drink: Drink) -> None`。实现为 `await asyncio.sleep(config.arm_stub_delay_s)` + 结构化日志（打出 drink 的 `arm_action` 标识）。接口即契约：队友的真实现替换这个类即可，编排器不改。
 - **DogExecutor**：`async def go_to(goal: Pose) -> None`。送货腿（goal=table）和返程腿（goal=station）复用同一实现。步骤：
   1. 查 `dimos_cli.status()`——nav blueprint 未运行则 `run_blueprint()` 启动并等待就绪（就绪判据：里程计话题开始有数据，沿用现有 `/api/pose` 的读取路径；启动后 30 s 内无数据视为启动失败）；已有**其他** blueprint 在跑则先 `stop()` 再启动（尊重单 WebRTC 连接约束）。
-  2. 通过 `nav_daemon` 发布目标位姿。
+  2. spawn `nav_leg.py` 子进程发布目标点并跟踪到达。
   3. 以 ~2 Hz 轮询里程计（复用现有 `/api/pose` 的底层读取），`dist(pose, goal) < arrival_radius` → 到达；超过 `nav_timeout_s` → 抛 `DeliveryTimeout`。
 
-### 4.2 `backend/nav_daemon.py`（新）
-仿 `teleop_daemon.py`：长驻小进程，用 dimos Python 环境向 nav blueprint 订阅的目标话题发布位姿。由 `dimos_cli.py` 新增的 `nav_goal(x, y, yaw)` / `nav_warm()` 函数管理（spawn、prime、复用）。具体话题名/消息类型在实现时从 `unitree-go2-nav-3d` blueprint 源码确认，同时需确认目标位姿所在坐标系与里程计位姿坐标系一致（否则到达判定失效；注意 `HACKATHON_STATE.md` §3 记录的 Unitree 固件 world-frame 累积地图怪癖）——这是**本设计中唯一未现场验证过的链路**，实施计划中排最早联调。
+### 4.2 `backend/nav_leg.py`（新；实施时取代原设想的 `nav_daemon.py`）
+**2026-07-25 修订（基于 Ascent 上 dimos 0.0.14b1 源码核实）**：不做常驻 warm-daemon——每单只发 2 次目标，改为**每条腿一个短生命周期子进程**（用 `dimos_cli.DIMOS_PY` 解释器 spawn）：`Dimos.connect()` → 等首个位姿（就绪判据）→ 发布目标 → 轮询位姿到进入到达半径或超时 → 退出。stdout 输出 JSONL 事件（`connected/ready/goal_sent/pose/arrived/timeout/pose_lost/error`），编排器异步读取。
+
+核实过的集成事实：
+- 目标入口是 `MovementManager.clicked_point: In[PointStamped]`——与 rerun viewer 点击走同一条路。话题 `/clicked_point`，消息 `PointStamped(x, y, z, ts, frame_id)`（无朝向 → `table`/`station` 配置不含 `yaw`）。
+- 位姿源：nav-3d 中 GO2 自带 odom 被重命名 `/odom_go2`；规划器 `world_frame="odom"` 用 PointLio 输出 → 到达判定 peek 流名 **`odometry`**（不是现有 lidar_daemon 写死的 `odom`，故不复用它）。
+- 取消导航：向 `/tele_cmd_vel` 发一条零速 `Twist` 会触发 `MovementManager._cancel_goal()`（内置）；直接发 NaN 目标会被 `_on_click` 过滤，不可行。
+- **风险**：`unitree-go2-nav-3d` 依赖外置 Mid-360 雷达 + PointLio。蓝图名/话题名/位姿流名全部为 `vendor_config.json` 配置项，现场如硬件不符可整体换蓝图不改代码。
 
 ### 4.3 `backend/vendor_config.json`（新）
 现场标定只改此文件，不改代码：
@@ -66,8 +72,15 @@ GET /api/vendor/status ← 前端 1 Hz 轮询（与现有面板轮询风格一�
     {"id": "sprite", "name": "雪碧",  "color": "#2ea84f", "arm_action": "pick_slot_2"},
     {"id": "water",  "name": "矿泉水", "color": "#2e7de0", "arm_action": "pick_slot_3"}
   ],
-  "table": {"x": 0.0, "y": 0.0, "yaw": 0.0},
-  "station": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+  "table": {"x": 2.0, "y": 0.0},
+  "station": {"x": 0.0, "y": 0.0},
+  "robot_ip": null,
+  "transport": null,
+  "nav_blueprint": "unitree-go2-nav-3d",
+  "goal_topic": "/clicked_point",
+  "goal_frame_id": "map",
+  "pose_topic": "odometry",
+  "cancel_topic": "/tele_cmd_vel",
   "arm_stub_delay_s": 5.0,
   "arrival_radius_m": 0.35,
   "nav_timeout_s": 90,
@@ -105,7 +118,7 @@ dog_delivering / dog_returning ── DeliveryTimeout / nav启动失败 ──�
 - 全内存态，不落盘；进程重启 = 回 `idle`（demo 可接受）。
 - `awaiting_pickup` 无超时：顾客不按确认就一直等，`reset` 是唯一出口。
 - 活动订单（`arm_picking` / `dog_delivering` / `awaiting_pickup` / `dog_returning`）期间新点单返回 `409 {"error": "order_in_progress"}`。
-- `reset`：取消编排 task → 若 nav 在跑则发一次零速度并 `dimos_cli.stop()` → 状态回 `idle`。除「确认取货」按钮（流程的正常组成部分）外，`reset` 是唯一人工干预出口，不设其他逐段确认。
+- `reset`：取消编排 task → kill 导航子进程 → 向 `/tele_cmd_vel` 发一条零速 Twist（触发 nav 栈内置的目标取消）→ 状态回 `idle`。**修订**：不再 `dimos_cli.stop()`——蓝图保留，重连成本高而取消目标已足够，恢复更快。除「确认取货」按钮（流程的正常组成部分）外，`reset` 是唯一人工干预出口，不设其他逐段确认。
 
 ## 6. API
 
@@ -132,7 +145,7 @@ dog_delivering / dog_returning ── DeliveryTimeout / nav启动失败 ──�
 ## 8. 测试策略
 
 - **Dry-run 模式**：环境变量 `VENDOR_FAKE_DOG=1` 时 DogExecutor 不碰 dimos，改为模拟位姿以恒定速度逼近目标。臂本来就是 stub。→ 整条「点击 → 状态机 → 时间线 UI」链路可在开发笔记本上无机器人联调。
-- **真机联调顺序**（在 Ascent 上）：① `sudo ./setup.sh`（LCM 前置，从未跑过）→ ② 手动验证 nav blueprint 可从 Ascent 启动并连狗（**Ascent 首次连接任何机器人**）→ ③ 验证 `nav_daemon` 目标下发 → ④ 全链路点单。
+- **真机联调顺序**（在 Ascent 上）：① `sudo ./setup.sh`（LCM 前置，从未跑过）→ ② 手动验证 nav blueprint 可从 Ascent 启动并连狗（**Ascent 首次连接任何机器人**）→ ③ 验证 `nav_leg.py` 目标下发（可单独手跑：`~/dimos-env/bin/python3 ~/dimos-pwa/backend/nav_leg.py --x 1 --y 0`）→ ④ 全链路点单。
 - 无自动化测试要求（hackathon）；`vendor.py` 状态机保持纯逻辑、与 dimos 调用隔离，便于将来补测。
 
 ## 9. 明确不做（本次范围外）
