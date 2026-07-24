@@ -16,7 +16,7 @@
 |---|---|
 | 命令通道 | **Ascent 直接控制**：vendor server 跑在 Ascent 上，通过本机 dimos 驱动两台机器人（非消息中转） |
 | 机械臂（Galaxea A1Z） | **只做接口 + stub**：定义固定的 ArmExecutor 接口，本次实现为可配置延时的模拟执行器；真实拓取动作由队友后续接入 |
-| 机器狗（Go2） | **真导航**：启动 dimOS nav blueprint（`unitree-go2-nav-3d`），下发硬编码桌位坐标，A* 规划 + 避障；**不做**脚本化速度序列兜底 |
+| 机器狗（Go2） | **真导航**：启动 dimOS nav blueprint（**`unitree-go2`**，2026-07-25 现场修订——原选的 `unitree-go2-nav-3d` 依赖未随 pip 分发的本地编译二进制 `pointlio_native`/`mls_planner` + Mid-360 外置雷达，Ascent 上不可用；`unitree-go2` 为纯 Python A* + 自带 L1 雷达，已实测从 Ascent 连通全遥测），下发硬编码桌位坐标；**不做**脚本化速度序列兜底 |
 | Server 形态 | **扩展现有后端**：`backend/main.py`（8090 单进程）新增 vendor 模块，与现有 blueprint 进程管理共享状态，避免两个进程抢 Go2 唯一的 WebRTC 连接 |
 | 编排时序 | **全自动流水线 + 一个取货确认点**：点击后自动推进；狗到桌后**暂停**等顾客按「确认取货」，确认后狗自动导航返回取餐站，到站订单完成。除此之外无人工干预；另保留全局 `reset` 紧急复位接口兜底（2026-07-25 补充决定，取代最初的「无任何中途确认」版本） |
 
