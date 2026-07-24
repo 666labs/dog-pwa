@@ -88,3 +88,48 @@ def test_reset_from_awaiting(tmp_path, monkeypatch):
         assert client.post("/api/vendor/reset").json()["state"] == "idle"
         # 复位后能再点
         assert client.post("/api/vendor/order", data={"drink_id": "cola"}).status_code == 200
+
+
+def test_estop_from_active(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        client.post("/api/vendor/order", data={"drink_id": "cola"})
+        wait_state(client, "dog_delivering")
+        r = client.post("/api/vendor/estop")
+        assert r.status_code == 200 and r.json()["state"] == "estopped"
+        # 急停期间不可下单
+        assert client.post("/api/vendor/order", data={"drink_id": "cola"}).status_code == 409
+        # reset 不能解除急停
+        assert client.post("/api/vendor/reset").json()["state"] == "estopped"
+        # 显式解除后恢复
+        assert client.post("/api/vendor/estop/release").status_code == 200
+        assert client.get("/api/vendor/status").json()["state"] == "idle"
+        assert client.post("/api/vendor/order", data={"drink_id": "cola"}).status_code == 200
+
+
+def test_estop_idempotent_from_idle(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.post("/api/vendor/estop").json()["state"] == "estopped"
+        assert client.post("/api/vendor/estop").json()["state"] == "estopped"  # 再按仍 200
+        assert client.post("/api/vendor/estop/release").status_code == 200
+
+
+def test_estop_release_wrong_state_409(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.post("/api/vendor/estop/release").status_code == 409
+
+
+def test_events_pose_map_in_status(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        client.post("/api/vendor/order", data={"drink_id": "cola"})
+        st = wait_state(client, "awaiting_pickup")
+        keys = [e["key"] for e in st["events"]]
+        for want in ("order_placed", "arm_pick_start", "arm_pick_done",
+                     "nav_start", "nav_arrived", "awaiting_pickup"):
+            assert want in keys, f"missing event {want}: {keys}"
+        assert st["pose"] is not None and "x" in st["pose"]  # fake 腿合成位姿
+        assert st["map"]["table"] == {"x": 1.0, "y": 0.0}
+        assert all("ts" in e and "zh" in e and "en" in e for e in st["events"])
