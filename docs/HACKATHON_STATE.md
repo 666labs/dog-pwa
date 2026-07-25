@@ -48,10 +48,15 @@ Robot maps a room; since heat can degrade real lidar, uses a LingBot-map-style c
 - Backend has two distinct control paths worth knowing apart (per `PWA_TEAMMATE_BRIEF.md`): the agent/text-command path (`/submit_query`, natural-language into whatever agent is wired up — the "autonomy" story) vs. the phone-tilt teleop path (`teleop-phone-go2`, direct `TwistStamped` velocity control with a dead-man's-switch safety pattern). Judging reportedly rewards genuine autonomy over teleop — worth keeping the manual-drive UI visually/narratively secondary regardless of which demo is chosen.
 - Known gap: **no auto-reconnect watchdog** — connection has died mid-session twice already (port conflict, WebRTC track failure); currently needs a human to notice and manually reconnect. Highest-risk gap for a live demo regardless of which demo concept is chosen.
 - Known constraint: only one WebRTC client connection to the robot at a time — coordinate before launching a new blueprint (`dimos status` / `dimos stop`), and `dimos stop` does not clean up orphaned satellite processes (`humancli`, `rerun-bridge`) that can block a fresh launch.
-- Vendor 控制台真机待验证项（2026-07-25 机器人没电延后）：Go2 相机代理出画面、
+- Vendor 控制台真机待验证项（2026-07-25 机器人没电延后）：
   真导航中 /api/vendor/estop 实停（零速连发路径）、Ascent 上臂 USB 相机设备号
-  （vendor_config.json: arm_camera_device）+ ARM_CAM_PY 解释器确认、隧道端到端
-  （cloudflared → https://dimos-drinks.vercel.app/?backend=<隧道URL>）。
+  （vendor_config.json: arm_camera_device）+ ARM_CAM_PY 解释器确认。
+- 2026-07-25 已真机验证：Go2 相机代理出画面（/api/camera/go2 health fresh、
+  snapshot 107KB 真实帧）；隧道端到端（cloudflared quick tunnel → API/快照/
+  MJPEG 流全通；浏览器实测 https://dimos-drinks.vercel.app 裸域名出 Go2
+  实时画面）。quick tunnel 域名每次重启都变——重启后跑
+  `demo-site/publish-live.sh`（把新域名烤进 config.js 并重发 Vercel，裸域名
+  即恢复实况；查看不发布用 `demo-site/live-url.sh`）。
 
 ### Galaxea A1Z arm — manual teleop solid, autonomy is the real gap
 - Real vendor-SDK-backed DimOS adapter (from upstream draft PR `dimensionalOS/dimos@adventure_x`), not a mock.

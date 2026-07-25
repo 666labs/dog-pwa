@@ -166,8 +166,14 @@ cd /home/alex/dev/AdventureX/dimos-pwa
 
 1. 在跑控制面板的机器上开隧道：
    `cloudflared tunnel --url http://localhost:8090`
-2. 打开 `https://<vercel域名>/?backend=<隧道URL>` —— 参数会记住
-   （localStorage），之后直接开裸域名也走真实后端；`?backend=off` 断开。
+2. 跑 `demo-site/publish-live.sh` —— 自动 SSH 读 Ascent 上 cloudflared 的
+   /quicktunnel 拿当前域名，烤进 `config.js` 并 `vercel deploy --prod`。
+   之后**裸域名直接就是实况**，无需任何参数。
+
+手动覆盖仍然可用：`?backend=<隧道URL>`（记入 localStorage，优先于烤入的
+默认值）；`?backend=off` 本次强制模拟并清除记忆。quick tunnel 域名每次
+重启都会变——重启后重跑 `publish-live.sh` 即可；只想查看当前链接（不
+发布）用 `demo-site/live-url.sh`。
 
 摄像头经 8090 代理（`/api/camera/{go2|arm}/stream.mjpg`），隧道只需暴露
 一个端口。臂相机 USB 设备号在 `backend/vendor_config.json` 的
