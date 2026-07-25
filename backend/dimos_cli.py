@@ -13,6 +13,7 @@ import re
 import select
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -321,6 +322,7 @@ def stop() -> Dict[str, object]:
     sport_kill()
     camera_kill()  # MJPEG daemon holds a subscription to this connection
     lidar_kill()   # lidar daemon holds a Dimos.connect() to this connection
+    diag_kill()    # its timeline is evidence about THIS connection; end it here
     return _stop_tracked_pid()
 
 
@@ -337,6 +339,8 @@ def restart() -> Dict[str, object]:
     sport_kill()
     camera_kill()  # run_blueprint (called below) respawns it for the new run
     lidar_kill()   # ditto — respawned by run_blueprint for the new connection
+    diag_kill()    # ditto — run_blueprint starts a FRESH per-run timeline file,
+                   # so the old run's evidence is closed off, not appended to
 
     st = status()
     if not st.get("running"):
@@ -397,6 +401,8 @@ def run_blueprint(blueprint: str, robot_ip: Optional[str] = None,
     sport_kill()
     camera_kill()  # old MJPEG daemon held a subscription to the old connection
     lidar_kill()   # old lidar daemon held a Dimos.connect() to the old connection
+    diag_kill()    # old collector's timeline covered the OLD connection; a new
+                   # one is started below against its own fresh output file
 
     args = [DIMOS_BIN]
     if robot_ip:
@@ -441,6 +447,21 @@ def run_blueprint(blueprint: str, robot_ip: Optional[str] = None,
     # PID from an unrelated run. run_blueprint_with_retry() relies on this
     # overwrite-per-attempt behaviour (see there).
     _save_tracked_run(proc.pid, blueprint, robot_ip, transport, _LAST_LAUNCH_LOG)
+
+    # Start the always-on network-diagnostics sidecar for this run. It must go
+    # HERE — after _save_tracked_run, because the collector's first act is to
+    # read the tracked run to learn which IP to ping, and before the daemon
+    # spawns below, so its timeline covers the camera/lidar warmup too (that
+    # warmup is itself a moment the connection has died in the past).
+    # Deliberately for EVERY blueprint, not just go2: an unexpected disconnect
+    # on a non-go2 run is exactly as worth having evidence about, and the
+    # collector degrades to "camera/lidar /health unreachable" samples rather
+    # than failing. Best-effort like the daemons below — a collector that will
+    # not start is never a reason to fail a robot launch.
+    try:
+        diag_start(blueprint)
+    except Exception:  # noqa: BLE001
+        pass
 
     # For go2 blueprints, eagerly spawn the plain-MJPEG camera daemon so the
     # dashboard's Camera panel has a stream to point at as soon as /color_image
@@ -1411,6 +1432,348 @@ def lidar_kill() -> None:
 
 def lidar_status() -> Dict[str, object]:
     return _lidar_daemon.status()
+
+
+# --------------------------------------------------------------------------- #
+# Always-on network diagnostics sidecar (backend/network_diagnostics.py)
+# --------------------------------------------------------------------------- #
+# WHY THIS IS AUTOMATIC. The silent-WebRTC-death evidence we need is only
+# collectable WHILE the incident is happening, and the incident is by definition
+# not announced. A collector someone has to remember to SSH in and start is a
+# collector that will not be running the one time it matters. So it is welded to
+# the run lifecycle instead: launching a blueprint through the panel starts it,
+# stopping/restarting kills it, and the teammate walking the robot does nothing
+# but launch and walk. The JSONL is simply on disk afterwards.
+#
+# HOW IT DIFFERS FROM THE CAMERA/LIDAR MANAGERS ABOVE (same shape otherwise):
+#   * No lazy ensure(): the public entry point is diag_start(), called exactly
+#     once from run_blueprint(). Nothing may spawn it as a side effect of a
+#     status probe — a collector that starts halfway through a run has a hole in
+#     the timeline precisely where the interesting part is, and a forensic tool
+#     with silent gaps is worse than no forensic tool.
+#   * One output file PER RUN, never a fixed path. Overwriting the previous
+#     run's evidence on relaunch would destroy the exact artifact this exists to
+#     produce (contrast _LAST_LAUNCH_LOG, which is deliberately fixed).
+#   * Spawned with sys.executable — THIS panel venv's python, not DIMOS_PY.
+#     network_diagnostics.py imports only stdlib plus our own dimos_cli /
+#     connection_watchdog, never `import dimos`, so the conda env would buy
+#     nothing and only add a way for it to break.
+# Its lifecycle is tied to the ROBOT CONNECTION (like camera/lidar), not to the
+# panel process (like the arm camera), because the run is what it is evidence
+# about.
+_DIAG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "network_diagnostics.py")
+
+# Evidence lives OUTSIDE /tmp on purpose: /tmp is where every other scratch file
+# in this project lives precisely because it is disposable, and this is the one
+# artifact that must survive a reboot long enough for someone to read it.
+DIAG_DIR = os.path.expanduser(
+    os.environ.get("DIMOS_DIAG_DIR", "~/dimos-network-diag"))
+
+# Kill switch. The collector is read-only toward the robot, but it does add ~1
+# ICMP/s and a LAN discovery sweep every ~40s to the same air the robot is using
+# — if that ever needs ruling out as a confounder mid-demo, set DIMOS_DIAG=0 and
+# restart the panel rather than editing this file under time pressure.
+DIAG_ENABLED = os.environ.get("DIMOS_DIAG", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+
+_DIAG_STEM_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+class _DiagDaemon:
+    """Owns the single network-diagnostics subprocess. Thread-safe start/kill.
+
+    Same manager discipline as _CameraDaemon/_LidarDaemon (single tracked
+    Popen, JSON readiness handshake on stdout, process-group SIGTERM-then-
+    SIGKILL teardown), with the differences documented in the block above."""
+
+    def __init__(self) -> None:
+        self.proc: Optional[subprocess.Popen] = None
+        self.out: Optional[str] = None
+        self.marker_file: Optional[str] = None
+        self.blueprint: Optional[str] = None
+        self.started_at: Optional[float] = None
+        self.ready: bool = False
+        self.lock = threading.Lock()
+
+    def _alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _readline(self, timeout: float) -> Optional[str]:
+        if self.proc is None or self.proc.stdout is None:
+            return None
+        r, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        if not r:
+            return None
+        return self.proc.stdout.readline()
+
+    def _kill_locked(self) -> None:
+        if self.proc is not None:
+            # SIGTERM first, always: the collector installs a SIGTERM handler
+            # that stops its loops, flushes the trailing partial log line and
+            # writes a `collector/summary` event. SIGKILL'ing it straight away
+            # would lose that closing record on every single run.
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        self.proc = None
+        self.ready = False
+        # out/marker_file/blueprint/started_at are NOT cleared: after the run
+        # ends the panel still wants to tell a human where the evidence it just
+        # finished writing actually landed. `alive` in status() is the liveness
+        # answer; these are the "what did the last run produce" answer.
+
+    def _spawn_locked(self, blueprint: str) -> Dict[str, object]:
+        started = time.time()
+        # <blueprint>-<unix ts>: unique per launch (so two runs never collide),
+        # sorts chronologically as plain text, and names the run it belongs to.
+        # The blueprint reaches us from an HTTP form field, so it is sanitised
+        # to a bare basename component before it is ever joined onto a path.
+        stem = _DIAG_STEM_RE.sub("_", str(blueprint or "run"))[:64] or "run"
+        stem = f"{stem}-{int(started)}"
+        try:
+            os.makedirs(DIAG_DIR, exist_ok=True)
+        except OSError as e:
+            return {"ok": False, "error": f"cannot create {DIAG_DIR}: {e}"}
+        out = os.path.join(DIAG_DIR, stem + ".jsonl")
+        marker_file = os.path.join(DIAG_DIR, stem + ".markers")
+        try:
+            # Create the marker file empty and up front so both ends have
+            # something real to work with immediately: the collector's file
+            # tail opens it on its first poll, and POST /api/diagnostics/marker
+            # appends to a file it knows the collector is already watching
+            # rather than racing to create one.
+            with open(marker_file, "a"):
+                pass
+        except OSError as e:
+            return {"ok": False, "error": f"cannot create marker file: {e}"}
+
+        args = [sys.executable, _DIAG_PATH, "--out", out,
+                "--marker-file", marker_file]
+        # Default flags otherwise: this runs unattended for a whole session, so
+        # --stderr-echo stays at its default "interesting" (never "all") and
+        # --stdout-jsonl stays off. That keeps stdout to the single readiness
+        # line, which is what makes the PIPE below safe to leave unread — a
+        # chatty stdout would fill the pipe buffer and wedge the collector.
+        self.proc = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            start_new_session=True,
+            # Same proxy strip as the run itself: the collector GETs the panel
+            # and the daemons on localhost and shells out to LAN discovery, all
+            # of which an http_proxy env var would silently break (see
+            # _clean_env). Its "everything is unreachable" timeline would then
+            # be measuring our own proxy, not the robot.
+            env=_clean_env())
+        self.out = out
+        self.marker_file = marker_file
+        self.blueprint = blueprint
+        self.started_at = started
+        # Stdlib-only startup with no dimOS import and no network call before
+        # the handshake, so this is sub-second in practice; 20s is slack for a
+        # loaded box, not an expected wait.
+        ready_line = self._readline(timeout=20)
+        if not ready_line:
+            self._kill_locked()
+            return {"ok": False,
+                    "error": "diagnostics collector did not signal readiness"}
+        try:
+            info = json.loads(ready_line)
+        except json.JSONDecodeError:
+            self._kill_locked()
+            return {"ok": False, "error": f"bad readiness line: {ready_line!r}"}
+        if not info.get("ready"):
+            self._kill_locked()
+            return {"ok": False,
+                    "error": info.get("error", "diagnostics collector init failed")}
+        self.ready = True
+        return {"ok": True, "out": out, "marker_file": marker_file,
+                "pid": self.proc.pid, "started_at": started}
+
+    def start(self, blueprint: str) -> Dict[str, object]:
+        """Deliberately NOT named ensure(): this always kills any previous
+        collector and starts a fresh one against a NEW output file, because it
+        is only ever called for a NEW run. Reusing a live collector across two
+        runs would merge two robot connections into one timeline, which is
+        exactly the confusion the per-run file exists to prevent."""
+        with self.lock:
+            if not DIAG_ENABLED:
+                return {"ok": False, "disabled": True,
+                        "error": "network diagnostics disabled (DIMOS_DIAG=0)"}
+            self._kill_locked()
+            return self._spawn_locked(blueprint)
+
+    def kill(self) -> None:
+        with self.lock:
+            self._kill_locked()
+
+    def status(self) -> Dict[str, object]:
+        with self.lock:
+            alive = self._alive()
+            return {
+                "alive": alive,
+                "ready": self.ready,
+                "enabled": DIAG_ENABLED,
+                "pid": self.proc.pid if self.proc else None,
+                "out": self.out,
+                "marker_file": self.marker_file,
+                "blueprint": self.blueprint,
+                "started_at": self.started_at,
+                # Only meaningful while alive; after teardown started_at
+                # describes the run that just finished, not a running clock.
+                "uptime_s": (time.time() - self.started_at
+                             if alive and self.started_at else None),
+                "dir": DIAG_DIR,
+            }
+
+
+_diag_daemon = _DiagDaemon()
+
+
+def diag_start(blueprint: str) -> Dict[str, object]:
+    """Start the always-on diagnostics collector for a run just launched.
+
+    Called once from run_blueprint(), after the tracked-run file is written —
+    the collector's first act is to read the tracked run for the robot IP it
+    should ping, so starting it any earlier would seed it with "nothing is
+    running". Best-effort by contract: the caller must not let a collector
+    failure fail the robot launch."""
+    return _diag_daemon.start(blueprint)
+
+
+def diag_kill() -> None:
+    """Tear down the diagnostics collector — called on run/stop/restart
+    alongside the camera and lidar daemons, because the timeline it is writing
+    is evidence ABOUT one robot connection and must end when that connection
+    does. NOT killed on panel shutdown alone (that is arm_camera_kill's
+    trigger); this one follows the robot, not the panel process."""
+    _diag_daemon.kill()
+
+
+def diag_status() -> Dict[str, object]:
+    """Liveness + the current run's out/marker_file paths. The API layer needs
+    the paths (to serve the JSONL and to append markers) and must not guess
+    them — only this manager knows which per-run file is the live one."""
+    return _diag_daemon.status()
+
+
+# --------------------------------------------------------------------------- #
+# Arm workcell USB camera daemon (backend/arm_camera_daemon.py)
+# --------------------------------------------------------------------------- #
+# Same manager shape as _CameraDaemon, but the source is a local USB camera —
+# no transport, NOT tied to the robot connection. Lives for the server's
+# lifetime; killed only via arm_camera_kill() on /api/server/shutdown.
+# Port 8772: clear of 8770 (go2 camera) and 8771 (lidar).
+_ARM_CAMERA_DAEMON_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "arm_camera_daemon.py")
+ARM_CAMERA_PORT = int(os.environ.get("ARM_CAMERA_PORT", "8772"))
+ARM_CAM_PY = os.environ.get("ARM_CAM_PY", DIMOS_PY)
+
+
+class _ArmCameraDaemon:
+    """Owns the single arm-camera subprocess. Thread-safe spawn/kill/ensure."""
+
+    def __init__(self) -> None:
+        self.proc: Optional[subprocess.Popen] = None
+        self.device: Optional[int] = None
+        self.port: int = ARM_CAMERA_PORT
+        self.ready: bool = False
+        self.lock = threading.Lock()
+
+    def _alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _readline(self, timeout: float) -> Optional[str]:
+        if self.proc is None or self.proc.stdout is None:
+            return None
+        r, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        if not r:
+            return None
+        return self.proc.stdout.readline()
+
+    def _kill_locked(self) -> None:
+        if self.proc is not None:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        self.proc = None
+        self.device = None
+        self.ready = False
+
+    def _spawn_locked(self, device: int) -> Dict[str, object]:
+        args = [ARM_CAM_PY, _ARM_CAMERA_DAEMON_PATH,
+                "--device", str(device), "--port", str(self.port)]
+        self.proc = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            start_new_session=True)
+        self.device = device
+        ready_line = self._readline(timeout=20)
+        if not ready_line:
+            self._kill_locked()
+            return {"ok": False,
+                    "error": "arm camera daemon did not signal readiness"}
+        try:
+            info = json.loads(ready_line)
+        except json.JSONDecodeError:
+            self._kill_locked()
+            return {"ok": False, "error": f"bad readiness line: {ready_line!r}"}
+        if not info.get("ready"):
+            self._kill_locked()
+            return {"ok": False,
+                    "error": info.get("error", "arm camera daemon init failed")}
+        self.ready = True
+        return {"ok": True, "port": self.port, "device": device}
+
+    def ensure(self, device: int = 0) -> Dict[str, object]:
+        with self.lock:
+            if self._alive() and self.device == device and self.ready:
+                return {"ok": True, "port": self.port, "device": device,
+                        "already": True}
+            self._kill_locked()
+            return self._spawn_locked(device)
+
+    def kill(self) -> None:
+        with self.lock:
+            self._kill_locked()
+
+    def status(self) -> Dict[str, object]:
+        with self.lock:
+            return {"alive": self._alive(), "ready": self.ready,
+                    "device": self.device, "port": self.port,
+                    "pid": self.proc.pid if self.proc else None}
+
+
+_arm_camera_daemon = _ArmCameraDaemon()
+
+
+def arm_camera_ensure(device: int = 0) -> Dict[str, object]:
+    """Lazily spawn (or reuse) the arm USB camera daemon."""
+    return _arm_camera_daemon.ensure(device)
+
+
+def arm_camera_kill() -> None:
+    _arm_camera_daemon.kill()
+
+
+def arm_camera_status() -> Dict[str, object]:
+    return _arm_camera_daemon.status()
 
 
 _ANSI_RE = _re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07")

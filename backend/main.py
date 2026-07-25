@@ -11,12 +11,14 @@ Run:
 """
 import json
 import os
+import re
 import signal
 import time
 import urllib.request
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, Form, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -36,6 +38,10 @@ FRONTEND_DIR = os.path.normpath(os.path.join(HERE, "..", "frontend"))
 CAMERA_PORT = 5555
 
 app = FastAPI(title="dimOS Control")
+
+# Vercel 双模式页跨域打隧道调本 API——黑客松场景直接全放开。
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
 
 # --------------------------------------------------------------------------- #
@@ -154,6 +160,8 @@ def _delayed_self_terminate():
     # process dies, then a plain SIGTERM (uvicorn's own graceful-shutdown
     # handler) rather than SIGKILL — same as Ctrl-C in a terminal.
     time.sleep(0.4)
+    # 臂相机 daemon 与机器人连接无关（run/stop 不管它），跟服务器生命周期走。
+    dimos_cli.arm_camera_kill()
     os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -418,6 +426,98 @@ def api_camera_stream():
         "frames": health.get("frames"),
         "age_s": health.get("age_s"),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Camera proxy — 隧道只暴露 8090，浏览器到不了 daemon 端口，由这里转发。
+# LAN 页同样走代理（省一套分支逻辑）。cam ∈ go2|arm。
+# --------------------------------------------------------------------------- #
+def _cam_port(cam: str):
+    """Resolve+ensure the daemon behind a camera name → (port, err|None)."""
+    if cam == "go2":
+        st = dimos_cli.status()
+        if not st.get("running"):
+            return None, {"ok": False, "reason": "no robot run is active"}
+        ens = dimos_cli.camera_ensure(st.get("transport"))
+        if not ens.get("ok"):
+            return None, {"ok": False,
+                          "reason": f"camera daemon failed: {ens.get('error')}"}
+        return dimos_cli.CAMERA_STREAM_PORT, None
+    if cam == "arm":
+        import vendor
+        try:
+            device = int(vendor.load_config().get("arm_camera_device", 0))
+        except Exception:  # noqa: BLE001
+            device = 0
+        ens = dimos_cli.arm_camera_ensure(device)
+        if not ens.get("ok"):
+            return None, {"ok": False,
+                          "reason": f"arm camera daemon failed: {ens.get('error')}"}
+        return dimos_cli.ARM_CAMERA_PORT, None
+    return None, {"ok": False, "reason": f"unknown camera '{cam}'"}
+
+
+def _local_open(port: int, path: str, timeout: float):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(f"http://localhost:{port}{path}", timeout=timeout)
+
+
+@app.get("/api/camera/{cam}/stream.mjpg")
+def api_camera_proxy_stream(cam: str):
+    """MJPEG pass-through。同步生成器 → FastAPI 线程池，每个观看者占一个
+    线程（现场 1-3 个客户端，够用）。上游断开即结束响应。"""
+    port, err = _cam_port(cam)
+    if err:
+        return JSONResponse(status_code=503, content=err)
+    try:
+        upstream = _local_open(port, "/stream.mjpg", timeout=5)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"ok": False, "reason": str(e)})
+    ctype = upstream.headers.get("Content-Type") \
+        or "multipart/x-mixed-replace; boundary=frame"
+
+    def gen():
+        try:
+            while True:
+                chunk = upstream.read(16384)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                upstream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return StreamingResponse(gen(), media_type=ctype,
+                             headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/camera/{cam}/snapshot.jpg")
+def api_camera_proxy_snapshot(cam: str):
+    port, err = _cam_port(cam)
+    if err:
+        return JSONResponse(status_code=503, content=err)
+    try:
+        with _local_open(port, "/snapshot.jpg", timeout=2.5) as r:
+            data = r.read()
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"ok": False, "reason": str(e)})
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/camera/{cam}/health")
+def api_camera_proxy_health(cam: str):
+    """永远 200 JSON——前端相机徽章直接消费 ok/fresh 字段。"""
+    port, err = _cam_port(cam)
+    if err:
+        return err
+    try:
+        with _local_open(port, "/health", timeout=1.5) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": str(e)}
 
 
 @app.get("/api/lidar-stream")
@@ -761,9 +861,158 @@ def api_topic_rate(name: str, seconds: float = 5.0, transport: Optional[str] = N
     return dimos_cli.topic_alive(name, seconds=seconds, transport=tr)
 
 
+# --------------------------------------------------------------------------- #
+# Network diagnostics (the always-on forensic collector — see
+# backend/network_diagnostics.py's docstring for what it collects and why, and
+# dimos_cli._DiagDaemon for why it starts and stops with the run)
+#
+# These three endpoints exist so the evidence is reachable WITHOUT SSH. During
+# an incident the person holding the tablet is the person who knows what just
+# happened physically, and they are not going to open a terminal on the Ascent
+# to say so or to fetch a file afterwards. Every one of these only touches local
+# files and the in-process daemon manager — nothing here goes near the robot.
+# --------------------------------------------------------------------------- #
+# A capture file name is a BARE BASENAME and nothing else: no directory
+# component, no leading dot, and it must end in .jsonl. `file` arrives as a
+# query param off the network, so it is validated against this before it is
+# joined onto any path, and the JOINED path is re-checked afterwards (see
+# api_diagnostics_download) — pattern first, resolved location second, because
+# neither check alone is sufficient.
+_DIAG_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$")
+
+# Cap on one marker line. A marker is a human note ("at the hallway corner");
+# anything longer is a mistake or an attempt to pad the evidence file, and the
+# collector reads this file line-by-line so an unbounded line is unbounded
+# memory on its side too.
+_DIAG_MARKER_MAX = 500
+
+
+@app.get("/api/diagnostics")
+def api_diagnostics():
+    """Status of the running collector, plus every capture already on disk.
+
+    Two things in one response because they answer the same question — "is
+    evidence being collected right now, and what evidence do we already have?"
+    — and the frontend would otherwise poll both. `collector` is null-ish
+    (alive: false) when no run is active, which is normal, not an error, so
+    this endpoint stays 200 in every case.
+
+    `files` covers PAST runs too: the whole point of a per-run output file is
+    that yesterday's incident is still there, so it must be discoverable
+    without knowing the naming scheme. Newest first — during a post-mortem the
+    file you want is essentially always the most recent one.
+    """
+    st = dimos_cli.diag_status()
+    diag_dir = dimos_cli.DIAG_DIR
+    active_out = st.get("out") if st.get("alive") else None
+
+    files = []
+    try:
+        names = os.listdir(diag_dir)
+    except OSError:
+        # Directory not created yet (nothing has ever been launched on this
+        # box). An empty listing is the honest answer, not a 500.
+        names = []
+    for name in names:
+        if not _DIAG_FILE_RE.match(name):
+            continue
+        path = os.path.join(diag_dir, name)
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue  # vanished between listdir and stat; just skip it
+        files.append({"name": name, "size": stat.st_size, "mtime": stat.st_mtime,
+                      "active": path == active_out})
+    files.sort(key=lambda f: f["mtime"], reverse=True)
+    return {"collector": st, "dir": diag_dir, "files": files}
+
+
+@app.get("/api/diagnostics/download")
+def api_diagnostics_download(file: str):
+    """Serve one capture file as a raw JSONL download.
+
+    `file` is untrusted network input naming a path, i.e. the classic traversal
+    shape, so it is guarded twice. First the name must match a safe basename
+    pattern (which already excludes `/`, `\\` and `..`). Then the JOINED path is
+    resolved with realpath and required to sit DIRECTLY inside the diagnostics
+    directory — that second check is what catches a symlink planted in the
+    directory pointing at, say, ~/.ssh, which no amount of name validation can
+    see. Only after both does anything get read.
+
+    Downloading a capture while its run is still live is fine and expected: the
+    collector appends with an explicit flush per event, so a partial read is
+    simply the timeline up to now.
+    """
+    name = (file or "").strip()
+    if not name or not _DIAG_FILE_RE.match(name):
+        raise HTTPException(status_code=400,
+                            detail="file must be a bare capture filename ending "
+                                   "in .jsonl (no path components)")
+    base = os.path.realpath(dimos_cli.DIAG_DIR)
+    path = os.path.realpath(os.path.join(base, name))
+    if os.path.dirname(path) != base or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail=f"no such capture: {name}")
+    return FileResponse(path, media_type="application/x-ndjson", filename=name)
+
+
+@app.post("/api/diagnostics/marker")
+def api_diagnostics_marker(text: str = Form(...)):
+    """Drop one human marker into the live timeline.
+
+    Markers are the single most valuable source in the whole capture: every
+    other source says WHAT the network did, and only a marker says WHERE THE
+    ROBOT WAS and what the human saw. The collector's original marker channel
+    was stdin, which is /dev/null now that it runs headless — so this appends a
+    line to the per-run marker file it is tailing, and it surfaces in the
+    timeline as the identical `marker` event a typed one would have produced.
+
+    Refuses (409) when no collector is running rather than creating a file
+    nobody is reading: a marker written into the void is worse than an error,
+    because the person typing it believes it was recorded.
+    """
+    line = (text or "").strip()
+    if not line:
+        raise HTTPException(status_code=400, detail="marker text is required")
+    # One marker is exactly one line — the collector splits on newlines, so an
+    # embedded newline would silently become two markers.
+    line = line.replace("\r", " ").replace("\n", " ")[:_DIAG_MARKER_MAX]
+
+    st = dimos_cli.diag_status()
+    marker_file = st.get("marker_file")
+    if not st.get("alive") or not marker_file:
+        raise HTTPException(
+            status_code=409,
+            detail="no diagnostics collector is running — it starts with a "
+                   "blueprint launch, so launch a run first (or check "
+                   "DIMOS_DIAG=0 has not disabled it)")
+    try:
+        # Append + flush, no read-modify-write: the collector is polling this
+        # same file, and a single short append is atomic enough that it can
+        # never see half a marker (and it holds back unterminated lines anyway).
+        with open(str(marker_file), "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"could not write marker: {e}")
+    return {"ok": True, "text": line, "marker_file": marker_file,
+            "out": st.get("out")}
+
+
 @app.get("/api/health")
 def api_health():
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Vendor demo (drink ordering → arm stub → Go2 nav delivery)
+# --------------------------------------------------------------------------- #
+import vendor  # noqa: E402  (after app setup, before the catch-all static mount)
+
+app.include_router(vendor.router)
+
+
+@app.get("/vendor")
+def vendor_page():
+    return FileResponse(os.path.join(FRONTEND_DIR, "vendor.html"))
 
 
 # --------------------------------------------------------------------------- #
