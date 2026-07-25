@@ -2,8 +2,11 @@
 /* Vendor 任务控制台共享核心 — LAN 真实页(frontend/) 与 Vercel 双模式页(demo-site/) 共用。
    模式解析:
      window.VENDOR_MODE === "real" → 同源 RealBackend("")
-     window.VENDOR_MODE === "auto" → ?backend=<url>(记入 localStorage) → RealBackend(url)
-                                     否则 MockBackend（浏览器内模拟）
+     window.VENDOR_MODE === "auto" → ?backend=<url>(记入 localStorage)
+                                     → localStorage → window.VENDOR_DEFAULT_BACKEND
+                                       (demo-site/config.js, publish-live.sh 烤入)
+                                     → 否则 MockBackend（浏览器内模拟）
+                                     ?backend=off 清存储并本次强制模拟。
    demo-site/vendor-app.js 是本文件的拷贝（demo-site/sync.sh 同步，勿单独改）。 */
 
 const $ = (id) => document.getElementById(id);
@@ -27,7 +30,8 @@ function resolveMode() {
   if (window.VENDOR_MODE === "real") return { kind: "real", base: "" };
   const qp = new URLSearchParams(location.search);
   let base = qp.get("backend");
-  if (base === "off" || base === "clear") {
+  const forcedOff = base === "off" || base === "clear";
+  if (forcedOff) {
     localStorage.removeItem("vendorBackend");
     base = null;
   } else if (base) {
@@ -35,6 +39,9 @@ function resolveMode() {
   } else {
     base = localStorage.getItem("vendorBackend");
   }
+  // 兜底:部署时由 demo-site/publish-live.sh 烤进 config.js 的默认后端——
+  // 裸域名零参数即直连真实后端;?backend=off 表示本次强制模拟,不吃兜底。
+  if (!base && !forcedOff) base = window.VENDOR_DEFAULT_BACKEND || null;
   if (base) {
     if (!/^https?:\/\//i.test(base)) base = "https://" + base;
     return { kind: "real", base: base.replace(/\/+$/, "") };
