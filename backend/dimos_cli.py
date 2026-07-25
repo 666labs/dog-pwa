@@ -459,7 +459,32 @@ def run_blueprint(blueprint: str, robot_ip: Optional[str] = None,
             lidar_ensure(transport)
         except Exception:  # noqa: BLE001
             pass
+        # Eagerly warm the teleop + sport daemons in the BACKGROUND (they were
+        # just killed above — every fresh run needs fresh ones). Previously the
+        # only warm trigger was the frontend's once-per-run guard, which never
+        # re-fired across a restart/stop-and-replace (running stayed true
+        # between its polls), so the first press after those paid the full
+        # ~1.5-2s daemon spawn inside the request — the observed
+        # first-command lag. A thread keeps the launch response instant; warm
+        # is idempotent, so a frontend warm arriving later is a cheap no-op.
+        threading.Thread(target=_warm_control_daemons, args=(transport,),
+                         daemon=True, name="daemon-warm").start()
     return {"launched": True, "launcher_pid": proc.pid, "cmd": " ".join(args)}
+
+
+def _warm_control_daemons(transport: Optional[str]) -> None:
+    """Best-effort background warm of the teleop + sport daemons for a fresh
+    run. MUST be called with the run's own transport — the daemons publish into
+    whichever bus they're spawned for, and a mismatch is silent (ok:true, robot
+    never sees the message)."""
+    try:
+        teleop_warm(transport=transport)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        sport_warm(transport=transport)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 _CRASH_SIGNATURES = (
@@ -1072,8 +1097,13 @@ class _SportDaemon:
             except (BrokenPipeError, OSError) as e:
                 self._kill_locked()
                 return {"ok": False, "error": f"sport daemon pipe broken: {e}"}
-            # RPC calls can legitimately take a few seconds; allow generous read.
-            ack = self._readline(timeout=20)
+            # The daemon answers when the RPC completes or its OWN timeout
+            # fires — so this read must outlast the rpc timeout the payload
+            # carries, or a healthy daemon gets killed mid-call (seen live:
+            # /api/sport's 25s sport_command window vs the old fixed 20s read
+            # — Dance animations >20s reported failure while the robot was
+            # still performing them, and the next command paid a cold spawn).
+            ack = self._readline(timeout=_sport_ack_window(payload))
             if ack is None:
                 self._kill_locked()
                 return {"ok": False, "error": "sport daemon send timeout"}
@@ -1092,6 +1122,16 @@ class _SportDaemon:
                     "transport": self.transport, "module": self.module,
                     "warmup_s": self.warmup_s,
                     "pid": self.proc.pid if self.proc else None}
+
+
+def _sport_ack_window(payload: Dict[str, object]) -> float:
+    """Pipe-read window for one sport-daemon ack: the rpc timeout the payload
+    carries plus dispatch margin, floored at the historical 20s default."""
+    try:
+        t = float(payload.get("timeout") or 0)
+    except (TypeError, ValueError):
+        t = 0.0
+    return max(20.0, t + 5.0)
 
 
 _sport_daemon = _SportDaemon()
@@ -1487,44 +1527,58 @@ def _spy_snapshot(seconds: float = 5.0, transport: Optional[str] = None):
     return rows, text
 
 
-def topic_alive(topic: str, seconds: float = 5.0,
-                transport: Optional[str] = None) -> Dict[str, object]:
-    """Is `topic` actually producing messages right now? Backed by `dimos spy`
-    (see `_spy_snapshot` for why `topic echo` can't be used for this).
+def _classify_topic(rows: Dict[str, Dict[str, object]], raw_text: str,
+                    topic: str) -> Dict[str, object]:
+    """Classify one topic from a spy snapshot into alive / dead / indeterminate.
 
-    Textual (the TUI framework `spy` is built on) redraws incrementally —
-    a row's topic/type text can render in full only once, with later frames
-    sending just updated frequency digits via cursor-positioned partial
-    updates. So a strict per-line column parse can miss a topic that's
-    genuinely active but whose full row happened to render before our
-    capture window's first read, or never re-render in full again. Primary
-    signal is the strict row parse (gives real Hz/bandwidth); if that comes
-    up empty, fall back to "does this exact topic name appear anywhere in
-    the captured output at all" — looser, but avoids a false "not alive"
-    from a rendering-timing miss rather than the topic genuinely being
-    silent.
+    Primary signal is the strict row parse (real Hz/bandwidth). Textual (the
+    TUI framework `spy` is built on) redraws incrementally — a row's topic/type
+    text can render in full only once, with later frames sending just updated
+    frequency digits via cursor-positioned partial updates — so a strict
+    per-line parse can miss a genuinely active topic. The fallback ("does the
+    exact topic name appear anywhere in the captured output") covers that, BUT
+    a name-only sighting can equally be a listed-but-silent topic whose 0 Hz
+    row rendered in fragments (robot powered off, publisher still registered —
+    this produced false "alive" reads on the dashboard with the robot off). So
+    the fallback keeps `alive: true` (avoids false-dead flapping on per-topic
+    tiles) but is flagged `indeterminate: true`, and anything deciding "is the
+    robot actually connected" must use the strict signal only (_strict_alive).
     """
-    with _SPY_LOCK:
-        rows, raw_text = _spy_snapshot(seconds=seconds, transport=transport)
     row = rows.get(topic)
     if row is not None:
         freq = float(row["freq_hz"])
-        return {
-            "topic": topic,
-            "count": round(freq * seconds),
-            "alive": freq > 0,
-            "sample": f"{row['type']} @ {freq:g} Hz, {row['bandwidth']}",
-        }
-
-    # Fallback: loose substring match, word-bounded so e.g. "/odom" doesn't
-    # false-positive inside a longer topic name like "/odom_raw".
+        return {"alive": freq > 0, "indeterminate": False,
+                "sample": f"{row['type']} @ {freq:g} Hz, {row['bandwidth']}"}
+    # Loose word-bounded name match so e.g. "/odom" doesn't false-positive
+    # inside a longer topic name like "/odom_raw".
     seen = bool(_re.search(re_escape_topic(topic) + r"(?!\w)", raw_text))
-    return {
-        "topic": topic,
-        "count": 1 if seen else 0,
-        "alive": seen,
-        "sample": "seen in spy output (rate unparsed — rendering timing)" if seen else None,
-    }
+    return {"alive": seen, "indeterminate": seen,
+            "sample": ("listed in spy output (rate unparsed — may be a stale/0Hz row)"
+                       if seen else None)}
+
+
+def _strict_alive(per_topic: Dict[str, dict]) -> bool:
+    """True only if at least one topic has a PARSED nonzero rate. Indeterminate
+    (name-seen-only) sightings never count — they can come from a silent topic's
+    fragmented 0 Hz row, exactly the robot-off case a liveness aggregate must
+    not report as alive."""
+    return any(v.get("alive") and not v.get("indeterminate")
+               for v in per_topic.values())
+
+
+def topic_alive(topic: str, seconds: float = 5.0,
+                transport: Optional[str] = None) -> Dict[str, object]:
+    """Is `topic` actually producing messages right now? Backed by `dimos spy`
+    (see `_spy_snapshot` for why `topic echo` can't be used for this) and
+    classified by `_classify_topic` — check `indeterminate` before treating
+    `alive` as proof of traffic."""
+    with _SPY_LOCK:
+        rows, raw_text = _spy_snapshot(seconds=seconds, transport=transport)
+    info = _classify_topic(rows, raw_text, topic)
+    row = rows.get(topic)
+    count = (round(float(row["freq_hz"]) * seconds) if row is not None
+             else (1 if info["alive"] else 0))
+    return {"topic": topic, "count": count, **info}
 
 
 def re_escape_topic(topic: str) -> str:
@@ -1538,19 +1592,18 @@ def any_topic_alive(topics: List[str], seconds: float = 5.0,
     topic — cheaper, and avoids several `spy` instances contending for the
     same subscription at once (seen to produce inconsistent per-run results
     on this robot's connection, which is itself genuinely intermittent —
-    different topics go quiet/active at different moments)."""
+    different topics go quiet/active at different moments).
+
+    The aggregate `alive` is STRICT (parsed nonzero rate only — see
+    _strict_alive): indeterminate name-only sightings don't count, so a
+    powered-off robot whose registered topics still appear in spy's table can
+    never aggregate to "alive". Per-topic entries keep the looser
+    alive+indeterminate shape for tile rendering."""
     with _SPY_LOCK:
         rows, raw_text = _spy_snapshot(seconds=seconds, transport=transport)
-    per_topic: Dict[str, dict] = {}
-    for t in topics:
-        row = rows.get(t)
-        if row is not None:
-            freq = float(row["freq_hz"])
-            per_topic[t] = {"alive": freq > 0, "sample": f"{row['type']} @ {freq:g} Hz, {row['bandwidth']}"}
-        else:
-            seen = bool(_re.search(re_escape_topic(t) + r"(?!\w)", raw_text))
-            per_topic[t] = {"alive": seen, "sample": "seen in spy output (rate unparsed)" if seen else None}
+    per_topic: Dict[str, dict] = {t: _classify_topic(rows, raw_text, t)
+                                  for t in topics}
     return {
         "topics": per_topic,
-        "alive": any(v["alive"] for v in per_topic.values()),
+        "alive": _strict_alive(per_topic),
     }
