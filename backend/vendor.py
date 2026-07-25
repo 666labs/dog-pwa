@@ -11,6 +11,8 @@ import collections
 import json
 import os
 import time
+import urllib.error
+import urllib.request
 from typing import Optional
 
 from fastapi import APIRouter, Form
@@ -22,6 +24,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_CONFIG = os.path.join(HERE, "vendor_config.json")
 NAV_LEG = os.path.join(HERE, "nav_leg.py")
 _NAV_LEG_LOG = os.environ.get("VENDOR_NAV_LOG", "/tmp/vendor-nav-leg.log")
+# 臂侧控制服务（队友的独立仓库/进程），契约见 _arm_pick。
+ARM_CONTROL_URL = os.environ.get("ARM_CONTROL_URL", "http://localhost:8100")
 
 IDLE = "idle"
 ARM_PICKING = "arm_picking"
@@ -92,6 +96,7 @@ class OrderManager:
             "dist_to_goal": self.dist_to_goal,
             "stage_started_at": self.stage_started_at,
             "fake_dog": _env_flag("VENDOR_FAKE_DOG"),
+            "fake_arm": _env_flag("VENDOR_FAKE_ARM"),
             "pose": self.pose,
             "map": map_info,
             "events": list(self.events),
@@ -149,12 +154,58 @@ class OrderManager:
                 self._set(IDLE)
 
     async def _arm_pick(self, drink: dict, cfg: dict) -> None:
-        """机械臂 stub：结构化日志 + 可配置延时。真实现替换本方法体即可，
-        入参契约（drink 含 arm_action，cfg 全量配置）保持不变。"""
-        print(json.dumps({"vendor_arm_stub": {
-            "drink": drink["id"], "arm_action": drink.get("arm_action"),
-        }}), flush=True)
-        await asyncio.sleep(float(cfg.get("arm_stub_delay_s", 5.0)))
+        """机械臂取货：POST {ARM_CONTROL_URL}/pick_drink，体 {"drink_id": ...}，
+        应答 {"success": bool, "error": str|null, "residual_mm": number|null}。
+        臂侧服务由队友在另一个仓库并行开发，现场可能根本没起来——所以连不上、
+        超时、非 200、非 JSON 全部收敛成 VendorError（消息直接展示给前端，
+        由 _run_order 统一进 failed），绝不让裸 socket 异常逃出去。
+        VENDOR_FAKE_ARM=1 时完全跳过 HTTP，退回原 stub 行为（日志 + 延时），
+        配合 VENDOR_FAKE_DOG=1 可零外部依赖跑完整演示。"""
+        if _env_flag("VENDOR_FAKE_ARM"):
+            print(json.dumps({"vendor_arm_stub": {
+                "drink": drink["id"], "arm_action": drink.get("arm_action"),
+            }}), flush=True)
+            await asyncio.sleep(float(cfg.get("arm_stub_delay_s", 5.0)))
+            return
+
+        url = f"{ARM_CONTROL_URL}/pick_drink"
+        body = json.dumps({"drink_id": drink["id"]}).encode("utf-8")
+        # 取货是物理动作，不是瞬时的；但也不能把状态机吊死
+        timeout = float(cfg.get("arm_timeout_s", 12.0))
+
+        def _post() -> dict:
+            # 本机/局域网直连，显式绕开系统代理——venue 上 http_proxy 指向
+            # Mihomo，会把 localhost 之外的请求打进代理（见 dimos_cli._clean_env）。
+            req = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={"Content-Type": "application/json"})
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+            return json.loads(raw)
+
+        try:
+            result = await asyncio.to_thread(_post)
+        except urllib.error.HTTPError as e:
+            raise VendorError(f"机械臂服务返回 HTTP {e.code}（{url}）")
+        except urllib.error.URLError as e:
+            raise VendorError(f"连不上机械臂服务：{e.reason}（{url}）")
+        except TimeoutError:
+            raise VendorError(f"机械臂服务响应超时（>{timeout:g}s，{url}）")
+        except json.JSONDecodeError:
+            raise VendorError("机械臂服务返回了非 JSON 响应")
+        except Exception as e:  # noqa: BLE001 — 任何意外都要变成可展示的失败原因
+            raise VendorError(f"机械臂调用失败：{e}")
+
+        if not isinstance(result, dict):
+            raise VendorError("机械臂服务返回了非法响应")
+        if not result.get("success"):
+            raise VendorError(result.get("error") or "机械臂取货失败（未说明原因）")
+        residual = result.get("residual_mm")
+        if residual is not None:
+            self._event("arm_residual", f"机械臂对位残差 {residual} mm",
+                        f"Arm alignment residual {residual} mm",
+                        {"residual_mm": residual})
 
     async def _dog_go_to(self, goal: dict, cfg: dict) -> None:
         if _env_flag("VENDOR_FAKE_DOG"):

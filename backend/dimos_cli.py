@@ -1776,6 +1776,442 @@ def arm_camera_status() -> Dict[str, object]:
     return _arm_camera_daemon.status()
 
 
+# --------------------------------------------------------------------------- #
+# MANUALLY-ARMED safety sidecars (connection watchdog + YOLO corridor watch)
+# --------------------------------------------------------------------------- #
+# READ THIS BEFORE WIRING EITHER OF THESE ANYWHERE ELSE.
+#
+# Both managers below are deliberately NOT called from run_blueprint(), stop(),
+# restart(), any availability probe, or server startup. That is the opposite of
+# the _DiagDaemon above (which IS welded to the run lifecycle on purpose), and
+# the difference is not an oversight:
+#
+#   * connection_watchdog.py can, on its own initiative, tear down and relaunch
+#     the running blueprint (via POST /api/run-with-retry). An operator must be
+#     able to have the panel running WITHOUT that armed — on a bench, while
+#     debugging, or while a human is standing next to the robot. Auto-arming an
+#     autonomous relaunch as a side effect of "the panel is up" is exactly the
+#     surprise this project already had one physical incident over.
+#   * yolo_watch_daemon.py is pure sensing (it reports obstacle_in_corridor and
+#     stops nothing itself), but it holds a GPU model and a second subscription
+#     on the same connection the demo depends on, so it is opt-in too.
+#
+# So the only way either starts is an explicit operator action:
+# POST /api/watchdog/start and POST /api/yolo-watch/start. Keep it that way.
+_WATCHDOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "connection_watchdog.py")
+
+# Where the watchdog's two output streams land. Its stdout is a JSON event
+# stream (one object per line, flushed per record) and its stderr is the
+# human-readable incident log — see connection_watchdog.py's OUTPUT PROTOCOL.
+# Both go to FILES rather than a subprocess PIPE, unlike the sibling managers
+# above: those daemons emit exactly one stdout line ever, so an unread pipe is
+# safe, whereas this one keeps emitting for the whole session and would
+# eventually fill a 64K pipe buffer and wedge itself mid-incident. Files also
+# give a human something to `tail -f` during a demo, which is half the point.
+WATCHDOG_EVENT_LOG = os.environ.get("DIMOS_WATCHDOG_EVENTS",
+                                    "/tmp/dimos-pwa-watchdog.jsonl")
+WATCHDOG_STDERR_LOG = os.environ.get("DIMOS_WATCHDOG_LOG",
+                                     "/tmp/dimos-pwa-watchdog.log")
+
+# The panel URL the watchdog polls (/api/status) and posts recovery to. Same
+# host/port start.sh binds; override if the panel is moved.
+WATCHDOG_PANEL_URL = os.environ.get("DIMOS_PANEL_URL", "http://127.0.0.1:8090")
+
+# How many recent events status() hands back to the UI, and how far back in the
+# event log it is willing to look for them.
+_WATCHDOG_TAIL_EVENTS = 12
+_WATCHDOG_TAIL_BYTES = 64 * 1024
+
+
+def _tail_text(path: str, limit: int = 2000) -> str:
+    """Last `limit` characters of a text file, or "" if unreadable."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r", errors="replace") as f:
+            if size > limit:
+                f.seek(size - limit)
+            return f.read()
+    except OSError:
+        return ""
+
+
+class _WatchdogDaemon:
+    """Owns the single connection-watchdog subprocess. Thread-safe start/kill.
+
+    Same manager discipline as _DiagDaemon (single tracked Popen, readiness
+    handshake before returning, process-group SIGTERM-then-SIGKILL teardown),
+    with two differences forced by what this particular sidecar is:
+
+      * Readiness arrives via the EVENT LOG FILE, not a stdout pipe (see the
+        comment on WATCHDOG_EVENT_LOG). The handshake is the watchdog's own
+        first `armed` event, which it emits after parsing argv and printing its
+        startup banner — so seeing it means the process is past every way it
+        can fail immediately.
+      * start() is only ever reached from an explicit operator POST. Nothing in
+        the run lifecycle may call it.
+
+    Spawned with sys.executable — THIS panel venv's python, not DIMOS_PY:
+    connection_watchdog.py is stdlib + our own dimos_cli and never imports
+    dimos, so the conda env would buy nothing (its own docstring says so).
+    """
+
+    def __init__(self) -> None:
+        self.proc: Optional[subprocess.Popen] = None
+        self.dry_run: bool = False
+        self.started_at: Optional[float] = None
+        self.ready: bool = False
+        # Byte offset in the (appended-to, never truncated) event log where THIS
+        # watchdog session's events begin. Keeps the previous session's trips
+        # from being reported as if they were this one's, without throwing the
+        # older incident record away.
+        self.events_from: int = 0
+        self.lock = threading.Lock()
+
+    def _alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _events_since_start(self, limit: int = _WATCHDOG_TAIL_EVENTS):
+        """Parse the tail of this session's event log -> list of dicts."""
+        try:
+            size = os.path.getsize(WATCHDOG_EVENT_LOG)
+        except OSError:
+            return []
+        start = max(self.events_from, size - _WATCHDOG_TAIL_BYTES)
+        out = []
+        try:
+            with open(WATCHDOG_EVENT_LOG, "r", errors="replace") as f:
+                f.seek(start)
+                if start > self.events_from:
+                    f.readline()  # drop the partial line the seek landed inside
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            return []
+        return out[-limit:] if limit else out
+
+    def _kill_locked(self) -> None:
+        if self.proc is not None:
+            # SIGTERM first: the watchdog handles it by clearing its stop event,
+            # joining the sentinel tailer and emitting a closing `stopped` event
+            # with its recovery count. SIGKILL would lose that record.
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                # Longer grace than the sibling daemons' 3s: a SIGTERM landing
+                # mid-recovery has to unwind a blocking POST to /api/run-with-retry.
+                self.proc.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        self.proc = None
+        self.ready = False
+        # started_at / dry_run / events_from are NOT cleared (same reasoning as
+        # _DiagDaemon): after disarming, the operator still wants to see what
+        # the session that just ended did — `alive` is the liveness answer.
+
+    def _spawn_locked(self, dry_run: bool) -> Dict[str, object]:
+        args = [sys.executable, _WATCHDOG_PATH, "--panel", WATCHDOG_PANEL_URL]
+        if dry_run:
+            args.append("--dry-run")
+        try:
+            # Append, never truncate: the event log is the record of what a
+            # silent recovery did, and re-arming the watchdog must not erase the
+            # incident that made the operator re-arm it.
+            self.events_from = (os.path.getsize(WATCHDOG_EVENT_LOG)
+                                if os.path.exists(WATCHDOG_EVENT_LOG) else 0)
+            out_f = open(WATCHDOG_EVENT_LOG, "a")
+            err_f = open(WATCHDOG_STDERR_LOG, "a")
+        except OSError as e:
+            return {"ok": False, "error": f"cannot open watchdog logs: {e}"}
+        started = time.time()
+        try:
+            self.proc = subprocess.Popen(
+                args, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
+                start_new_session=True,
+                # Same proxy strip as the run itself: the watchdog GETs the
+                # panel and the daemons on localhost and shells out to LAN
+                # discovery, all of which an http_proxy var silently breaks.
+                env=_clean_env())
+        except OSError as e:
+            return {"ok": False, "error": f"cannot spawn watchdog: {e}"}
+        finally:
+            # The child holds its own dup'd fds; the parent has no use for these.
+            out_f.close()
+            err_f.close()
+        self.dry_run = dry_run
+        self.started_at = started
+
+        # Handshake: wait for the watchdog's own first `armed` event. Stdlib-only
+        # startup with no network call before it, so this is sub-second normally.
+        deadline = time.time() + 20
+        armed = None
+        while time.time() < deadline:
+            for rec in self._events_since_start(limit=0):
+                if rec.get("event") == "armed" and rec.get("t", 0) >= started - 2:
+                    armed = rec
+                    break
+            if armed is not None:
+                break
+            if not self._alive():
+                break
+            time.sleep(0.2)
+        if armed is None:
+            tail = _tail_text(WATCHDOG_STDERR_LOG, 600).strip()
+            self._kill_locked()
+            return {"ok": False,
+                    "error": "connection watchdog did not signal `armed`"
+                             + (f" — stderr tail: {tail[-400:]}" if tail else "")}
+        self.ready = True
+        return {"ok": True, "pid": self.proc.pid, "dry_run": dry_run,
+                "started_at": started, "armed": armed,
+                "event_log": WATCHDOG_EVENT_LOG, "stderr_log": WATCHDOG_STDERR_LOG}
+
+    def start(self, dry_run: bool) -> Dict[str, object]:
+        """Arm the watchdog. Idempotent for an identical arming; changing the
+        dry-run/armed mode restarts it (that IS the arming toggle, so it must
+        actually take effect rather than silently no-op)."""
+        with self.lock:
+            if self._alive() and self.ready and self.dry_run == dry_run:
+                return {"ok": True, "already": True, "pid": self.proc.pid,
+                        "dry_run": self.dry_run, "started_at": self.started_at,
+                        "event_log": WATCHDOG_EVENT_LOG,
+                        "stderr_log": WATCHDOG_STDERR_LOG}
+            self._kill_locked()
+            return self._spawn_locked(dry_run)
+
+    def kill(self) -> None:
+        with self.lock:
+            self._kill_locked()
+
+    def status(self) -> Dict[str, object]:
+        with self.lock:
+            alive = self._alive()
+            events = self._events_since_start() if self.started_at else []
+            trips = [e for e in events if e.get("event") == "tripped"]
+            recoveries = [e for e in events if e.get("event") == "recovery_result"]
+            return {
+                "alive": alive,
+                "ready": self.ready,
+                "dry_run": self.dry_run,
+                "pid": self.proc.pid if self.proc else None,
+                "started_at": self.started_at,
+                "uptime_s": (time.time() - self.started_at
+                             if alive and self.started_at else None),
+                "event_log": WATCHDOG_EVENT_LOG,
+                "stderr_log": WATCHDOG_STDERR_LOG,
+                "panel": WATCHDOG_PANEL_URL,
+                # Enough for the UI to say "armed, 0 trips" or "TRIPPED 2min ago,
+                # recovery ok" without shipping the whole log to the browser.
+                "trips": len(trips),
+                "last_trip": trips[-1] if trips else None,
+                "last_recovery": recoveries[-1] if recoveries else None,
+                "recent_events": events,
+            }
+
+
+_watchdog_daemon = _WatchdogDaemon()
+
+
+def watchdog_start(dry_run: bool = False) -> Dict[str, object]:
+    """Arm the connectivity watchdog (backend/connection_watchdog.py).
+
+    MANUAL ONLY — called from POST /api/watchdog/start and nowhere else. Do not
+    call this from run_blueprint/restart/startup: see the block comment above.
+
+    dry_run=True exercises detection + IP re-discovery and logs the exact
+    recovery call WITHOUT POSTing it — the safe way to validate the wiring with
+    a robot present, and the recommended first click.
+
+    Scope reminder (enforced inside connection_watchdog.py, not here): its only
+    outbound side effect is POST /api/run-with-retry to restore the data link.
+    It never resumes or retries a movement or nav goal.
+    """
+    return _watchdog_daemon.start(bool(dry_run))
+
+
+def watchdog_kill() -> None:
+    """Disarm the watchdog — POST /api/watchdog/stop. NOT called from the run
+    lifecycle: the operator armed it explicitly, so a restart of the blueprint
+    (which is exactly what the watchdog itself triggers on recovery) must not
+    silently disarm it."""
+    _watchdog_daemon.kill()
+
+
+def watchdog_status() -> Dict[str, object]:
+    return _watchdog_daemon.status()
+
+
+# --------------------------------------------------------------------------- #
+# YOLO collision-corridor watch daemon (backend/yolo_watch_daemon.py)
+# --------------------------------------------------------------------------- #
+# Same manager shape as _CameraDaemon (DIMOS_PY interpreter — it does `import
+# dimos` — single stdout readiness line, PIPE handshake), with one difference:
+# NO lazy ensure() from a probe and no call from run_blueprint. It is armed by
+# an explicit operator POST only. It serves GET /health on YOLO_WATCH_PORT with
+# {ok, obstacle_in_corridor, detections, fresh, age_s, ...}; it is a pure
+# sensor — it stops nothing by itself, a consumer must act on it.
+_YOLO_WATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "yolo_watch_daemon.py")
+YOLO_WATCH_PORT = int(os.environ.get("DIMOS_YOLO_WATCH_PORT", "8097"))
+YOLO_WATCH_TOPIC = os.environ.get("DIMOS_YOLO_WATCH_TOPIC", "/color_image")
+
+
+class _YoloWatchDaemon:
+    """Owns the single yolo-watch subprocess. Thread-safe spawn/kill/status."""
+
+    def __init__(self) -> None:
+        self.proc: Optional[subprocess.Popen] = None
+        self.transport: Optional[str] = None
+        self.topic: str = YOLO_WATCH_TOPIC
+        self.port: int = YOLO_WATCH_PORT
+        self.conf: Optional[float] = None
+        self.ready: bool = False
+        self.started_at: Optional[float] = None
+        self.info: Optional[Dict[str, object]] = None
+        self.lock = threading.Lock()
+
+    def _alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _readline(self, timeout: float) -> Optional[str]:
+        if self.proc is None or self.proc.stdout is None:
+            return None
+        r, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        if not r:
+            return None
+        return self.proc.stdout.readline()
+
+    def _kill_locked(self) -> None:
+        if self.proc is not None:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        self.proc = None
+        self.transport = None
+        self.conf = None
+        self.ready = False
+        self.started_at = None
+        self.info = None
+
+    def _spawn_locked(self, transport: Optional[str], topic: Optional[str],
+                      conf: Optional[float]) -> Dict[str, object]:
+        self.topic = (topic or YOLO_WATCH_TOPIC)
+        args = [DIMOS_PY, _YOLO_WATCH_PATH,
+                "--topic", self.topic, "--port", str(self.port)]
+        if transport:
+            args += ["--transport", transport]
+        if conf is not None:
+            args += ["--conf", str(conf)]
+        started = time.time()
+        self.proc = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            start_new_session=True)
+        self.transport = transport
+        self.conf = conf
+        self.started_at = started
+        # Much longer than the camera/lidar daemons' 45s on purpose: this one
+        # additionally loads YOLO weights (auto-DOWNLOADING them on a cold box
+        # if yolo11n.pt isn't staged next to the daemon) and burns a CUDA warmup
+        # pass before it binds. Those are one-off costs, but they are the
+        # difference between "slow first arm" and a false "did not signal
+        # readiness" that kills a working daemon.
+        ready_line = self._readline(timeout=180)
+        if not ready_line:
+            self._kill_locked()
+            return {"ok": False, "error": "yolo watch daemon did not signal readiness"}
+        try:
+            info = json.loads(ready_line)
+        except json.JSONDecodeError:
+            self._kill_locked()
+            return {"ok": False, "error": f"bad readiness line: {ready_line!r}"}
+        if not info.get("ready"):
+            self._kill_locked()
+            return {"ok": False, "error": info.get("error", "yolo watch init failed")}
+        self.ready = True
+        self.info = info
+        return {"ok": True, "port": self.port, "topic": self.topic,
+                "transport": info.get("transport"), "model": info.get("model"),
+                "device": info.get("device"), "warmup_s": info.get("warmup_s"),
+                "pid": self.proc.pid, "started_at": started}
+
+    def start(self, transport: Optional[str], topic: Optional[str],
+              conf: Optional[float]) -> Dict[str, object]:
+        """Deliberately NOT ensure(): nothing may spawn this as a side effect of
+        a status probe. Re-arming with identical settings is a no-op; anything
+        different respawns."""
+        with self.lock:
+            want_topic = topic or YOLO_WATCH_TOPIC
+            if (self._alive() and self.ready and self.transport == transport
+                    and self.topic == want_topic and self.conf == conf):
+                return {"ok": True, "already": True, "port": self.port,
+                        "topic": self.topic, "transport": self.transport,
+                        "pid": self.proc.pid, "started_at": self.started_at}
+            self._kill_locked()
+            return self._spawn_locked(transport, want_topic, conf)
+
+    def kill(self) -> None:
+        with self.lock:
+            self._kill_locked()
+
+    def status(self) -> Dict[str, object]:
+        with self.lock:
+            alive = self._alive()
+            return {"alive": alive, "ready": self.ready, "port": self.port,
+                    "topic": self.topic, "transport": self.transport,
+                    "conf": self.conf,
+                    "pid": self.proc.pid if self.proc else None,
+                    "started_at": self.started_at,
+                    "uptime_s": (time.time() - self.started_at
+                                 if alive and self.started_at else None),
+                    "model": (self.info or {}).get("model"),
+                    "device": (self.info or {}).get("device"),
+                    "health_url": f"http://127.0.0.1:{self.port}/health"}
+
+
+_yolo_watch_daemon = _YoloWatchDaemon()
+
+
+def yolo_watch_start(transport: Optional[str] = None,
+                     topic: Optional[str] = None,
+                     conf: Optional[float] = None) -> Dict[str, object]:
+    """Arm the YOLO collision-corridor watch daemon.
+
+    MANUAL ONLY — POST /api/yolo-watch/start and nowhere else. `transport` must
+    match the running blueprint's (lcm|zenoh) or it will connect to nothing.
+    Blocks through model load + connect + bind (see the 180s handshake bound).
+    """
+    return _yolo_watch_daemon.start(transport or None, topic or None, conf)
+
+
+def yolo_watch_kill() -> None:
+    """Disarm the corridor watch — POST /api/yolo-watch/stop."""
+    _yolo_watch_daemon.kill()
+
+
+def yolo_watch_status() -> Dict[str, object]:
+    return _yolo_watch_daemon.status()
+
+
 _ANSI_RE = _re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07")
 _SPY_ROW_RE = _re.compile(
     r"^(lcm|zenoh)\s+(\S+)\s+(\S+)\s+([\d.]+)\s+(.+?)\s*$"

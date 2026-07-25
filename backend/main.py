@@ -162,6 +162,15 @@ def _delayed_self_terminate():
     time.sleep(0.4)
     # 臂相机 daemon 与机器人连接无关（run/stop 不管它），跟服务器生命周期走。
     dimos_cli.arm_camera_kill()
+    # Same reasoning for the two manually-armed sidecars, plus a safety one:
+    # both run in their OWN session (start_new_session=True), so they survive
+    # this process. An orphaned watchdog would then keep polling and could fire
+    # a recovery relaunch against a panel that a DIFFERENT operator restarted
+    # and never armed it on. Arming is per-panel-session by construction.
+    # (This is teardown on an explicit operator shutdown — nothing here arms
+    # anything, and nothing in the run lifecycle touches these.)
+    dimos_cli.watchdog_kill()
+    dimos_cli.yolo_watch_kill()
     os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -995,6 +1004,109 @@ def api_diagnostics_marker(text: str = Form(...)):
         raise HTTPException(status_code=500, detail=f"could not write marker: {e}")
     return {"ok": True, "text": line, "marker_file": marker_file,
             "out": st.get("out")}
+
+
+# --------------------------------------------------------------------------- #
+# Manually-armed safety sidecars: connectivity watchdog + YOLO corridor watch
+# --------------------------------------------------------------------------- #
+# THESE ARE OPERATOR-TRIGGERED ONLY. Nothing here is called from startup, from
+# /api/run, /api/run-with-retry, /api/stop, /api/restart, or from any
+# availability probe — deliberately unlike the diagnostics collector, which is
+# welded to the run lifecycle. Rationale in dimos_cli.py's block comment above
+# _WatchdogDaemon: the watchdog can relaunch the blueprint on its own
+# initiative, and nothing that could surprise a human standing next to the
+# robot may arm itself as a side effect of the panel merely being up. The UI
+# surfaces the state and the buttons; a person decides.
+@app.post("/api/watchdog/start")
+def api_watchdog_start(dry_run: bool = Form(False)):
+    """Arm the connectivity watchdog (backend/connection_watchdog.py).
+
+    It watches for a SILENT WebRTC death (camera AND lidar /health stale
+    together, or a robot-side death sentinel in the blueprint log) and recovers
+    by re-discovering the robot's CURRENT IP and POSTing /api/run-with-retry —
+    the data/telemetry link only. It never resumes, re-sends or retries a
+    movement or nav goal; if the robot was mid-goal when the link died,
+    reconnecting does not restart that goal.
+
+    dry_run=true does everything including re-discovery but stops short of
+    POSTing the recovery — the safe first click, and the way to validate
+    detection (kill camera_daemon + lidar_daemon) with no relaunch risk.
+
+    Blocks ~1s for the watchdog's `armed` handshake. Re-arming with the same
+    dry_run is a no-op; flipping dry_run restarts it so the change takes.
+    """
+    res = dimos_cli.watchdog_start(bool(dry_run))
+    res["daemon"] = dimos_cli.watchdog_status()
+    return res
+
+
+@app.post("/api/watchdog/stop")
+def api_watchdog_stop():
+    """Disarm the watchdog. Safe at any time; SIGTERM lets it write its closing
+    event first. Leaves the robot run itself completely alone."""
+    dimos_cli.watchdog_kill()
+    return {"ok": True, "daemon": dimos_cli.watchdog_status()}
+
+
+@app.get("/api/watchdog/status")
+def api_watchdog_status():
+    """Armed? dry-run or live? tripped yet? Includes this session's recent
+    events (trip / recovery_result / ...) so the panel can show that a silent
+    recovery happened, which is the whole point of the tool."""
+    return dimos_cli.watchdog_status()
+
+
+@app.post("/api/yolo-watch/start")
+def api_yolo_watch_start(transport: Optional[str] = Form(None),
+                         topic: Optional[str] = Form(None),
+                         conf: Optional[str] = Form(None)):
+    """Arm the YOLO collision-corridor watch daemon (backend/yolo_watch_daemon.py).
+
+    A camera-based second opinion on "is something directly ahead of me",
+    independent of the lidar map that missed a table's legs. It only REPORTS —
+    GET http://<host>:8097/health -> {ok, obstacle_in_corridor, detections,
+    fresh, age_s, ...}. It does not stop the robot; a consumer must act on it.
+
+    transport defaults to the running blueprint's (it must match, or the daemon
+    subscribes to nothing). This call blocks through YOLO weight load + CUDA
+    warmup + robot connect — usually a few seconds, but up to a couple of
+    minutes on a cold box that has to download the weights.
+    """
+    tr = (transport or "").strip().lower() or None
+    if tr not in (None, "lcm", "zenoh"):
+        raise HTTPException(status_code=400, detail="transport must be lcm or zenoh")
+    if tr is None:
+        tr = (dimos_cli.status().get("transport") or None)
+    # Taken as a string and parsed here, not as Form(float): an empty-string
+    # field (what a form sends for "left blank") would 422 before reaching us.
+    conf_v: Optional[float] = None
+    if (conf or "").strip():
+        try:
+            conf_v = float(conf)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="conf must be a number")
+        if not 0.0 < conf_v <= 1.0:
+            raise HTTPException(status_code=400, detail="conf must be in (0, 1]")
+    res = dimos_cli.yolo_watch_start(transport=tr,
+                                     topic=(topic or "").strip() or None,
+                                     conf=conf_v)
+    res["daemon"] = dimos_cli.yolo_watch_status()
+    return res
+
+
+@app.post("/api/yolo-watch/stop")
+def api_yolo_watch_stop():
+    """Disarm the corridor watch and free its GPU model + subscription."""
+    dimos_cli.yolo_watch_kill()
+    return {"ok": True, "daemon": dimos_cli.yolo_watch_status()}
+
+
+@app.get("/api/yolo-watch/status")
+def api_yolo_watch_status():
+    """Liveness + where its /health lives. The obstacle reading itself comes
+    from that /health endpoint directly, not from here — this is the process
+    manager's view, not the sensor's."""
+    return dimos_cli.yolo_watch_status()
 
 
 @app.get("/api/health")

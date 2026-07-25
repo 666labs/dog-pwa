@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f0f" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" href="/icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+  <link rel="stylesheet" href="/style.css" />
+  <title>dimOS Vendor</title>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="b1">dim</span><span class="b2">OS</span>
+      <span class="b3">Vendor</span>
+    </div>
+    <nav class="nav">
+      <a href="/" class="v-navlink">&larr; Dashboard</a>
+    </nav>
+    <span id="fake-badge" class="pill" style="margin-left:auto">mode ?</span>
+    <span id="conn-pill" class="pill" style="margin-left:8px">connecting</span>
+  </header>
+
+  <main>
+    <!-- E-stop banner: only rendered while state === estopped -->
+    <div id="estop-banner" class="v-estop-banner" hidden>
+      <div class="v-estop-banner-txt">&#128721; EMERGENCY STOP ENGAGED &mdash; order aborted, nav killed</div>
+      <button id="btn-estop-release" class="btn">Release e-stop</button>
+    </div>
+
+    <h1 class="view-title">Drink Delivery</h1>
+
+    <div class="grid">
+
+      <!-- ===================== ORDER ===================== -->
+      <section class="panel span2" id="p-order">
+        <h2>Order <span class="sub">tap a drink &middot; one order at a time</span></h2>
+        <div id="menu" class="v-menu"><p class="muted" style="font-size:11px">loading menu&hellip;</p></div>
+        <div id="msg-order" class="msg"></div>
+      </section>
+
+      <!-- ===================== STATE ===================== -->
+      <section class="panel span2" id="p-state">
+        <h2>Order State <span class="sub">/api/vendor/status &middot; 1.2s poll</span></h2>
+        <div id="big-state" class="v-state s-idle">idle</div>
+        <div id="state-sub" class="muted" style="font-size:12px">no active order</div>
+        <div class="tiles" style="margin-top:4px">
+          <div class="tile"><div class="t-label">Drink</div><div class="t-val" id="t-drink">&mdash;</div></div>
+          <div class="tile"><div class="t-label">Dist to goal (m)</div><div class="t-val" id="t-dist">&mdash;</div></div>
+          <div class="tile"><div class="t-label">Pose x / y</div><div class="t-val" id="t-pose">&mdash;</div></div>
+          <div class="tile"><div class="t-label">Stage time</div><div class="t-val" id="t-stage">&mdash;</div></div>
+        </div>
+        <div id="msg-state" class="msg"></div>
+        <div class="row">
+          <button id="btn-confirm" class="btn primary v-confirm" hidden>&#10003; Confirm pickup</button>
+          <button id="btn-reset" class="btn ghost">Reset</button>
+        </div>
+      </section>
+
+      <!-- ===================== EVENTS ===================== -->
+      <section class="panel span2" id="p-events">
+        <h2>Events <span class="sub">state-machine timeline</span></h2>
+        <div id="event-feed" class="feed short"></div>
+      </section>
+
+      <!-- ===================== NAV LOG ===================== -->
+      <section class="panel span2" id="p-navlog">
+        <h2>Nav Log <span class="sub">nav_leg.py stderr tail &middot; raw</span></h2>
+        <details id="navlog-details">
+          <summary class="v-summary">show raw nav log</summary>
+          <div class="row" style="margin-top:8px">
+            <button id="btn-navlog" class="btn">Refresh</button>
+            <label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;letter-spacing:0">
+              <input type="checkbox" id="navlog-auto" /> auto (3s)
+            </label>
+            <span id="navlog-status" class="pill">idle</span>
+          </div>
+          <div id="navlog-feed" class="feed" style="margin-top:8px"></div>
+        </details>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- Always-visible e-stop, pinned to the bottom of the viewport -->
+  <div class="v-estop-bar">
+    <button id="btn-estop" class="estop">&#9632; E-STOP</button>
+  </div>
+
+  <footer class="footer">
+    <span id="host-label"></span> &middot; <a href="/">main dashboard</a> &middot; relative-path API
+  </footer>
+
+  <script src="/vendor.js"></script>
+</body>
+</html>
