@@ -92,7 +92,8 @@ narrower inflation only when needed). Repro: `clearance_test.py`.
 - `_find_wide_path` sizes `[1.1]` → `[2.2, 1.7, 1.3, 1.1]`
 - `VoxelGridMapper` `emit_every` 5 → 2 (costmap integrates fresh obstacles
   ~2.5x sooner while walking)
-- `nerf_speed=0.6` (0.55 → 0.33 m/s cruise, requested demo pacing)
+- `nerf_speed=0.45` (0.55 → ~0.25 m/s cruise; was 0.6/0.33 until 2026-07-25,
+  lowered further for the slow obstacle-avoidance test run)
 - companion: `backend/vendor_config.json` `arrival_radius_m` 0.35 → 0.5
   (safe-goal displacement near tables must not false-timeout the nav leg)
 

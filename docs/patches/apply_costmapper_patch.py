@@ -17,7 +17,8 @@ Round 2 — clearance (see README.md "clearance"):
     - restore GlobalPlanner._find_wide_path wide-first size ladder
       [1.1] -> [2.2, 1.7, 1.3, 1.1] (0.55m berth when space allows)
     - VoxelGridMapper emit_every 5 -> 2 (fresh obstacles mapped sooner)
-    - nerf_speed=0.6 (0.55 -> 0.33 m/s, requested demo pacing)
+    - nerf_speed=0.45 (0.55 -> ~0.25 m/s; lowered from 0.6/0.33 on 2026-07-25
+      for the slow obstacle-avoidance test run)
 
 Companion (not in this script): backend/vendor_config.json arrival_radius_m
 0.35 -> 0.5, so safe-goal displacement near tables doesn't false-timeout the
@@ -61,7 +62,7 @@ OLD_VOXEL = "    VoxelGridMapper.blueprint(emit_every=5),\n"
 NEW_VOXEL = "    VoxelGridMapper.blueprint(emit_every=2),\n"
 
 OLD_GC = ').global_config(n_workers=10, robot_model="unitree_go2")'
-NEW_GC = ').global_config(n_workers=10, robot_model="unitree_go2", nerf_speed=0.6, robot_width=0.5)'
+NEW_GC = ').global_config(n_workers=10, robot_model="unitree_go2", nerf_speed=0.45, robot_width=0.5)'
 
 OLD_SIZES = "        sizes_to_try: list[float] = [1.1]\n"
 NEW_SIZES = "        sizes_to_try: list[float] = [2.2, 1.7, 1.3, 1.1]\n"
