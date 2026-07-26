@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>dimOS 饮料速递 · Drink Delivery (Online)</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Noto Sans SC", sans-serif;
+    background: #0e1116; color: #e8eaed;
+    display: flex; flex-direction: column;
+    user-select: none; -webkit-user-select: none;
+  }
+  .en { color: #7d879c; font-weight: 400; }
+
+  header {
+    padding: 14px 22px; display: flex; align-items: center; gap: 14px;
+    border-bottom: 1px solid #1d2330; flex-wrap: wrap;
+  }
+  header h1 { font-size: 20px; font-weight: 700; letter-spacing: .5px; }
+  header h1 .en { font-size: 14px; margin-left: 6px; }
+  .badge {
+    font-size: 12px; font-weight: 700; border-radius: 6px; padding: 3px 10px;
+    border: 1px solid; letter-spacing: .5px;
+  }
+  .badge.live { color: #34c65a; border-color: #34c65a; }
+  .badge.sim  { color: #d9a441; border-color: #d9a441; }
+  .badge.off  { color: #e0655e; border-color: #e0655e; }
+  #estopBtn {
+    margin-left: auto; font-size: 17px; font-weight: 800; color: #fff;
+    background: #c62828; border: 2px solid #ff5f52; border-radius: 12px;
+    padding: 10px 20px; cursor: pointer; line-height: 1.2;
+  }
+  #estopBtn .en { color: #ffd7d4; font-size: 11px; display: block; }
+  #estopBtn:active { filter: brightness(.8); }
+
+  #simNote {
+    padding: 8px 22px; font-size: 12px; color: #7d879c;
+    background: #12161f; border-bottom: 1px solid #1d2330; display: none;
+  }
+  #simNote b { color: #9aa3b5; }
+  #simNote a { color: #3d6ff2; }
+
+  #console {
+    flex: 1; display: grid; grid-template-columns: 400px 1fr;
+    gap: 16px; padding: 16px 22px; min-height: 0; align-items: start;
+    overflow: auto;
+  }
+  @media (max-width: 900px) { #console { grid-template-columns: 1fr; } }
+
+  #sysline { font-size: 12px; color: #7d879c; padding: 4px 2px 10px; }
+
+  /* ---- 菜单 ---- */
+  #menu {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  }
+  .card {
+    border: 1px solid #232a3a; border-radius: 16px; background: #141926;
+    padding: 20px 12px; text-align: center; cursor: pointer;
+    transition: transform .12s ease;
+    min-height: 170px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 8px;
+  }
+  .card:active { transform: scale(.96); }
+  .card .dot {
+    width: 62px; height: 62px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 32px; line-height: 1;
+  }
+  .card .name { font-size: 20px; font-weight: 700; }
+  .card .name-en { font-size: 13px; color: #7d879c; margin-top: -4px; }
+  .card .hint { font-size: 11px; color: #7d879c; }
+
+  /* ---- 进度 ---- */
+  #progress { display: none; flex-direction: column; gap: 16px; }
+  #orderTitle { font-size: 20px; font-weight: 700; }
+  #orderTitle .en { font-size: 14px; display: block; margin-top: 4px; }
+  #stages { display: flex; flex-direction: column; gap: 8px; }
+  .stage {
+    display: flex; align-items: center; gap: 12px; padding: 8px 14px;
+    border-radius: 10px; border: 1px solid #232a3a; background: #141926;
+    font-size: 15px; color: #7d879c;
+  }
+  .stage .idx {
+    width: 24px; height: 24px; border-radius: 50%; border: 2px solid #2b3040;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; flex-shrink: 0;
+  }
+  .stage .lbl { display: flex; flex-direction: column; }
+  .stage .lbl .en { font-size: 11px; }
+  .stage.done { color: #9aa3b5; }
+  .stage.done .idx { border-color: #2ea84f; color: #2ea84f; }
+  .stage.active { color: #fff; border-color: #3d6ff2; background: #17203a; }
+  .stage.active .idx { border-color: #3d6ff2; color: #3d6ff2; }
+
+  .bigBtn {
+    font-size: 20px; font-weight: 700; color: #fff; border: none; cursor: pointer;
+    border-radius: 14px; padding: 16px 30px; background: #2ea84f;
+    display: none; line-height: 1.4;
+  }
+  .bigBtn .en { color: #d9f2e0; font-size: 13px; display: block; }
+  .bigBtn:active { filter: brightness(.85); }
+  #doneMark { display: none; font-size: 48px; text-align: center; }
+  #failBox { display: none; flex-direction: column; gap: 12px; }
+  #failMsg { color: #e0655e; font-size: 15px; }
+  #resetBtn {
+    font-size: 16px; color: #fff; background: #b0413b; border: none;
+    border-radius: 10px; padding: 12px 26px; cursor: pointer; align-self: flex-start;
+  }
+
+  /* ---- 时间线 ---- */
+  #timelineWrap h3 {
+    font-size: 13px; color: #9aa3b5; font-weight: 700; margin: 14px 0 8px;
+    letter-spacing: .5px;
+  }
+  #timeline {
+    display: flex; flex-direction: column; gap: 4px;
+    max-height: 300px; overflow-y: auto;
+  }
+  .ev {
+    display: flex; align-items: baseline; gap: 10px; padding: 5px 10px;
+    border-radius: 8px; font-size: 13px; color: #9aa3b5; background: #12161f;
+  }
+  .ev .t { font-family: ui-monospace, monospace; font-size: 11px; color: #4a5468; flex-shrink: 0; }
+  .ev .en { font-size: 11px; }
+  .ev.latest { background: #17203a; color: #fff; border: 1px solid #26314d; }
+  .ev.bad { color: #ff8a80; }
+  .tlEmpty { font-size: 12px; color: #4a5468; padding: 6px 10px; }
+
+  /* ---- 实况列 ---- */
+  .cams { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 560px) { .cams { grid-template-columns: 1fr; } }
+  .cam {
+    border: 1px solid #232a3a; border-radius: 12px; background: #0a0d12;
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .camBody { aspect-ratio: 16 / 9; position: relative; background: #0a0d12; }
+  .camBody img, .camBody canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
+  }
+  .cam figcaption {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: #9aa3b5; padding: 7px 10px;
+    border-top: 1px solid #1d2330;
+  }
+  .chip {
+    margin-left: auto; font-size: 10px; font-weight: 700; border-radius: 5px;
+    padding: 1px 7px; border: 1px solid #2b3040; color: #7d879c;
+  }
+  .chip.live { color: #34c65a; border-color: #34c65a; }
+  .chip.wait { color: #d9a441; border-color: #d9a441; }
+  .chip.sim  { color: #d9a441; border-color: #d9a441; }
+  .chip.off  { color: #e0655e; border-color: #e0655e; }
+
+  #telemetry {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-top: 12px;
+  }
+  @media (max-width: 560px) { #telemetry { grid-template-columns: repeat(3, 1fr); } }
+  .tl {
+    border: 1px solid #232a3a; border-radius: 10px; background: #141926;
+    padding: 8px 10px; display: flex; flex-direction: column; gap: 2px;
+  }
+  .tl .k { font-size: 10px; color: #7d879c; letter-spacing: .5px; }
+  .tl .v { font-size: 16px; font-weight: 700; font-family: ui-monospace, monospace; }
+
+  #mapCanvas {
+    width: 100%; height: 220px; margin-top: 12px;
+    border: 1px solid #232a3a; border-radius: 12px; background: #0a0d12; display: block;
+  }
+
+  #navlogWrap { margin-top: 12px; }
+  #navlogWrap summary { font-size: 13px; color: #9aa3b5; cursor: pointer; padding: 4px 0; }
+  #navlogBox {
+    font-family: ui-monospace, monospace; font-size: 11px; color: #7d879c;
+    background: #0a0d12; border: 1px solid #232a3a; border-radius: 10px;
+    padding: 10px; max-height: 180px; overflow-y: auto; white-space: pre-wrap;
+    word-break: break-all; margin-top: 6px;
+  }
+
+  /* ---- 急停遮罩 ---- */
+  #estopOverlay {
+    position: fixed; inset: 0; z-index: 50; display: none;
+    background: rgba(112, 12, 12, .95);
+    align-items: center; justify-content: center; text-align: center;
+  }
+  #estopOverlay .inner { display: flex; flex-direction: column; gap: 18px; align-items: center; }
+  #estopOverlay .sign { font-size: 72px; }
+  #estopOverlay h2 { font-size: 34px; letter-spacing: 2px; }
+  #estopOverlay h2 .en { color: #ffb4ae; font-size: 18px; display: block; margin-top: 6px; }
+  #estopTime { font-size: 13px; color: #ffb4ae; }
+  #releaseBtn {
+    font-size: 18px; font-weight: 700; color: #7a1210; background: #fff;
+    border: none; border-radius: 12px; padding: 16px 34px; cursor: pointer;
+  }
+  #releaseBtn .en { color: #b0413b; font-size: 12px; display: block; }
+
+  #miniReset {
+    position: fixed; right: 16px; bottom: 14px; font-size: 12px; color: #4a5468;
+    background: none; border: none; cursor: pointer; padding: 8px;
+  }
+  #toast {
+    position: fixed; top: 18px; left: 50%; transform: translateX(-50%); z-index: 60;
+    background: #17203a; border: 1px solid #3d6ff2; color: #fff;
+    padding: 10px 22px; border-radius: 10px; font-size: 15px;
+    opacity: 0; pointer-events: none; transition: opacity .25s; text-align: center;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>🤖 dimOS 饮料速递<span class="en">Drink Delivery</span></h1>
+    <span id="badge" class="badge sim">模拟 SIM</span>
+    <button id="estopBtn">🛑 急停<span class="en">EMERGENCY STOP</span></button>
+  </header>
+  <div id="simNote"></div>
+
+  <main id="console">
+    <section id="flowCol">
+      <div id="sysline"></div>
+      <div id="menu"></div>
+      <div id="progress">
+        <div id="orderTitle"></div>
+        <div id="stages"></div>
+        <div id="doneMark">🎉</div>
+        <button id="confirmBtn" class="bigBtn">我已取到饮料 ✓<span class="en">I've got my drink</span></button>
+        <div id="failBox">
+          <div id="failMsg"></div>
+          <button id="resetBtn">重置 Reset</button>
+        </div>
+      </div>
+      <div id="timelineWrap">
+        <h3>事件时间线 <span class="en">TIMELINE</span></h3>
+        <div id="timeline"></div>
+      </div>
+    </section>
+
+    <section id="liveCol">
+      <div class="cams">
+        <figure class="cam">
+          <div class="camBody" id="camGo2Body"></div>
+          <figcaption>🐕 Go2 视角 <span class="en">Go2 POV</span><span class="chip" id="camGo2Chip">—</span></figcaption>
+        </figure>
+        <figure class="cam">
+          <div class="camBody" id="camArmBody"></div>
+          <figcaption>🦾 机械臂工位 <span class="en">Arm workcell</span><span class="chip" id="camArmChip">—</span></figcaption>
+        </figure>
+      </div>
+      <div id="telemetry">
+        <div class="tl"><span class="k">位姿 X (m)</span><span class="v" id="tX">—</span></div>
+        <div class="tl"><span class="k">位姿 Y (m)</span><span class="v" id="tY">—</span></div>
+        <div class="tl"><span class="k">速度 SPEED</span><span class="v" id="tSpd">—</span></div>
+        <div class="tl"><span class="k">距目标 DIST</span><span class="v" id="tDist">—</span></div>
+        <div class="tl"><span class="k">电量 BATT</span><span class="v" id="tBatt">—</span></div>
+      </div>
+      <canvas id="mapCanvas"></canvas>
+      <details id="navlogWrap">
+        <summary>导航日志 <span class="en">NAV LOG</span></summary>
+        <pre id="navlogBox"></pre>
+      </details>
+    </section>
+  </main>
+
+  <div id="estopOverlay">
+    <div class="inner">
+      <div class="sign">🛑</div>
+      <h2>已紧急停止<span class="en">E-STOPPED</span></h2>
+      <div id="estopTime"></div>
+      <button id="releaseBtn">解除急停<span class="en">Release E-stop</span></button>
+    </div>
+  </div>
+
+  <button id="miniReset" title="复位 Reset">复位 Reset</button>
+  <div id="toast"></div>
+
+<script>window.VENDOR_MODE = "auto";</script>
+<script src="config.js"></script><!-- publish-live.sh 生成;缺失时 404 无害(走模拟) -->
+<script src="vendor-app.js"></script>
+</body>
+</html>

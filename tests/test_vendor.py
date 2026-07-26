@@ -1,0 +1,151 @@
+"""Vendor 状态机测试 — 全部走 VENDOR_FAKE_DOG=1 模拟路径，无机器人。"""
+import importlib
+import json
+import os
+import sys
+import time
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+BACKEND = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend")
+sys.path.insert(0, BACKEND)
+
+
+def make_app(tmp_path, monkeypatch):
+    cfg = {
+        "drinks": [{"id": "cola", "name": "可乐", "color": "#e0312e", "arm_action": "pick_slot_1"}],
+        "table": {"x": 1.0, "y": 0.0},
+        "station": {"x": 0.0, "y": 0.0},
+        "arm_stub_delay_s": 0.05,
+        "arrival_radius_m": 0.35,
+        "nav_timeout_s": 5,
+        "result_display_s": 0.2,
+    }
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(cfg))
+    monkeypatch.setenv("VENDOR_CONFIG_PATH", str(p))
+    monkeypatch.setenv("VENDOR_FAKE_DOG", "1")
+    monkeypatch.setenv("VENDOR_FAKE_DOG_DIST", "1.0")
+    monkeypatch.setenv("VENDOR_FAKE_DOG_SPEED", "8.0")
+    import vendor
+    importlib.reload(vendor)  # 每个测试拿到全新的 OrderManager
+    app = FastAPI()
+    app.include_router(vendor.router)
+    return app
+
+
+def wait_state(client, target, timeout=5.0):
+    s = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        s = client.get("/api/vendor/status").json()
+        if s["state"] == target:
+            return s
+        time.sleep(0.05)
+    raise AssertionError(f"state never reached {target!r}, last={s}")
+
+
+def test_menu(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        drinks = client.get("/api/vendor/menu").json()["drinks"]
+        assert drinks[0]["id"] == "cola"
+        assert "arm_action" not in drinks[0]  # 内部字段不外泄
+
+
+def test_unknown_drink_404(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.post("/api/vendor/order", data={"drink_id": "nope"}).status_code == 404
+
+
+def test_full_flow(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        r = client.post("/api/vendor/order", data={"drink_id": "cola"})
+        assert r.status_code == 200 and r.json()["order_id"] == 1
+        wait_state(client, "awaiting_pickup")
+        # 送达途中/等待确认时再点单 → 409
+        assert client.post("/api/vendor/order", data={"drink_id": "cola"}).status_code == 409
+        assert client.post("/api/vendor/confirm").status_code == 200
+        wait_state(client, "delivered")
+        wait_state(client, "idle")
+
+
+def test_confirm_wrong_state_409(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.post("/api/vendor/confirm").status_code == 409
+
+
+def test_reset_from_awaiting(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        client.post("/api/vendor/order", data={"drink_id": "cola"})
+        wait_state(client, "awaiting_pickup")
+        assert client.post("/api/vendor/reset").json()["state"] == "idle"
+        # 复位后能再点
+        assert client.post("/api/vendor/order", data={"drink_id": "cola"}).status_code == 200
+
+
+def test_estop_from_active(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        client.post("/api/vendor/order", data={"drink_id": "cola"})
+        wait_state(client, "dog_delivering")
+        r = client.post("/api/vendor/estop")
+        assert r.status_code == 200 and r.json()["state"] == "estopped"
+        # 急停期间不可下单
+        assert client.post("/api/vendor/order", data={"drink_id": "cola"}).status_code == 409
+        # reset 不能解除急停
+        assert client.post("/api/vendor/reset").json()["state"] == "estopped"
+        # 显式解除后恢复
+        assert client.post("/api/vendor/estop/release").status_code == 200
+        assert client.get("/api/vendor/status").json()["state"] == "idle"
+        assert client.post("/api/vendor/order", data={"drink_id": "cola"}).status_code == 200
+
+
+def test_estop_idempotent_from_idle(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.post("/api/vendor/estop").json()["state"] == "estopped"
+        assert client.post("/api/vendor/estop").json()["state"] == "estopped"  # 再按仍 200
+        assert client.post("/api/vendor/estop/release").status_code == 200
+
+
+def test_estop_release_wrong_state_409(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.post("/api/vendor/estop/release").status_code == 409
+
+
+def test_events_pose_map_in_status(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        client.post("/api/vendor/order", data={"drink_id": "cola"})
+        st = wait_state(client, "awaiting_pickup")
+        keys = [e["key"] for e in st["events"]]
+        for want in ("order_placed", "arm_pick_start", "arm_pick_done",
+                     "nav_start", "nav_arrived", "awaiting_pickup"):
+            assert want in keys, f"missing event {want}: {keys}"
+        assert st["pose"] is not None and "x" in st["pose"]  # fake 腿合成位姿
+        assert st["map"]["table"] == {"x": 1.0, "y": 0.0}
+        assert all("ts" in e and "zh" in e and "en" in e for e in st["events"])
+
+
+def test_navlog_tail(tmp_path, monkeypatch):
+    log = tmp_path / "nav.log"
+    log.write_text("line1\nline2\nline3\n")
+    monkeypatch.setenv("VENDOR_NAV_LOG", str(log))
+    app = make_app(tmp_path, monkeypatch)  # make_app 里 reload(vendor) 会重读环境
+    with TestClient(app) as client:
+        assert client.get("/api/vendor/navlog?lines=2").json()["lines"] == ["line2", "line3"]
+
+
+def test_navlog_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("VENDOR_NAV_LOG", str(tmp_path / "absent.log"))
+    app = make_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        assert client.get("/api/vendor/navlog").json()["lines"] == []

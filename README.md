@@ -1,5 +1,12 @@
 # dimOS Control
 
+> **⚠️ ARCHIVED (2026-07-26).** The canonical repo is now
+> **`dimos-pwa`** (github.com/liuliuliuLabs/dimos-pwa, branch `alex-branch`) —
+> the copy actually deployed on the Ascent GX10 (30.201.220.87). `demo-site/`
+> (the Vercel page) has been migrated there, along with the vendor state
+> machine tests. Do not develop here; this stays as history + docs
+> (`docs/patches/`, `docs/superpowers/` remain useful references).
+
 A PWA control panel for **dimOS** (dimensionalOS). It's a thin FastAPI app that
 shells out to the `dimos` CLI as subprocesses and exposes a graphical UI over it.
 It does **not** import dimOS Python modules or touch the dimOS conda env — it runs
@@ -158,3 +165,23 @@ cd /home/alex/dev/AdventureX/dimos-pwa
 ./venv/bin/pip install fastapi uvicorn python-multipart psutil
 ./run.sh
 ```
+
+## 公网直播模式（Vercel 双模式页）
+
+`demo-site/` 部署在 Vercel 上，默认是浏览器内模拟。要让公网页面显示真实
+机器人画面/状态并可急停：
+
+1. 在跑控制面板的机器上开隧道：
+   `cloudflared tunnel --url http://localhost:8090`
+2. 跑 `demo-site/publish-live.sh` —— 自动 SSH 读 Ascent 上 cloudflared 的
+   /quicktunnel 拿当前域名，烤进 `config.js` 并 `vercel deploy --prod`。
+   之后**裸域名直接就是实况**，无需任何参数。
+
+手动覆盖仍然可用：`?backend=<隧道URL>`（记入 localStorage，优先于烤入的
+默认值）；`?backend=off` 本次强制模拟并清除记忆。quick tunnel 域名每次
+重启都会变——重启后重跑 `publish-live.sh` 即可；只想查看当前链接（不
+发布）用 `demo-site/live-url.sh`。
+
+摄像头经 8090 代理（`/api/camera/{go2|arm}/stream.mjpg`），隧道只需暴露
+一个端口。臂相机 USB 设备号在 `backend/vendor_config.json` 的
+`arm_camera_device`（默认 0）。改完共享前端后运行 `demo-site/sync.sh` 同步。

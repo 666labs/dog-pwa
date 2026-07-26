@@ -16,7 +16,8 @@ import time
 import urllib.request
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, Form, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -36,6 +37,10 @@ FRONTEND_DIR = os.path.normpath(os.path.join(HERE, "..", "frontend"))
 CAMERA_PORT = 5555
 
 app = FastAPI(title="dimOS Control")
+
+# Vercel 双模式页跨域打隧道调本 API——黑客松场景直接全放开。
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
 
 def _effective_transport(tr: Optional[str]) -> Optional[str]:
@@ -171,6 +176,8 @@ def _delayed_self_terminate():
     # process dies, then a plain SIGTERM (uvicorn's own graceful-shutdown
     # handler) rather than SIGKILL — same as Ctrl-C in a terminal.
     time.sleep(0.4)
+    # 臂相机 daemon 与机器人连接无关（run/stop 不管它），跟服务器生命周期走。
+    dimos_cli.arm_camera_kill()
     os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -435,6 +442,98 @@ def api_camera_stream():
         "frames": health.get("frames"),
         "age_s": health.get("age_s"),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Camera proxy — 隧道只暴露 8090，浏览器到不了 daemon 端口，由这里转发。
+# LAN 页同样走代理（省一套分支逻辑）。cam ∈ go2|arm。
+# --------------------------------------------------------------------------- #
+def _cam_port(cam: str):
+    """Resolve+ensure the daemon behind a camera name → (port, err|None)."""
+    if cam == "go2":
+        st = dimos_cli.status()
+        if not st.get("running"):
+            return None, {"ok": False, "reason": "no robot run is active"}
+        ens = dimos_cli.camera_ensure(st.get("transport"))
+        if not ens.get("ok"):
+            return None, {"ok": False,
+                          "reason": f"camera daemon failed: {ens.get('error')}"}
+        return dimos_cli.CAMERA_STREAM_PORT, None
+    if cam == "arm":
+        import vendor
+        try:
+            device = int(vendor.load_config().get("arm_camera_device", 0))
+        except Exception:  # noqa: BLE001
+            device = 0
+        ens = dimos_cli.arm_camera_ensure(device)
+        if not ens.get("ok"):
+            return None, {"ok": False,
+                          "reason": f"arm camera daemon failed: {ens.get('error')}"}
+        return dimos_cli.ARM_CAMERA_PORT, None
+    return None, {"ok": False, "reason": f"unknown camera '{cam}'"}
+
+
+def _local_open(port: int, path: str, timeout: float):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(f"http://localhost:{port}{path}", timeout=timeout)
+
+
+@app.get("/api/camera/{cam}/stream.mjpg")
+def api_camera_proxy_stream(cam: str):
+    """MJPEG pass-through。同步生成器 → FastAPI 线程池，每个观看者占一个
+    线程（现场 1-3 个客户端，够用）。上游断开即结束响应。"""
+    port, err = _cam_port(cam)
+    if err:
+        return JSONResponse(status_code=503, content=err)
+    try:
+        upstream = _local_open(port, "/stream.mjpg", timeout=5)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"ok": False, "reason": str(e)})
+    ctype = upstream.headers.get("Content-Type") \
+        or "multipart/x-mixed-replace; boundary=frame"
+
+    def gen():
+        try:
+            while True:
+                chunk = upstream.read(16384)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                upstream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return StreamingResponse(gen(), media_type=ctype,
+                             headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/camera/{cam}/snapshot.jpg")
+def api_camera_proxy_snapshot(cam: str):
+    port, err = _cam_port(cam)
+    if err:
+        return JSONResponse(status_code=503, content=err)
+    try:
+        with _local_open(port, "/snapshot.jpg", timeout=2.5) as r:
+            data = r.read()
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"ok": False, "reason": str(e)})
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/camera/{cam}/health")
+def api_camera_proxy_health(cam: str):
+    """永远 200 JSON——前端相机徽章直接消费 ok/fresh 字段。"""
+    port, err = _cam_port(cam)
+    if err:
+        return err
+    try:
+        with _local_open(port, "/health", timeout=1.5) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": str(e)}
 
 
 @app.get("/api/lidar-stream")
@@ -803,6 +902,19 @@ def api_topic_rate(name: str, seconds: float = 5.0, transport: Optional[str] = N
 @app.get("/api/health")
 def api_health():
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Vendor demo (drink ordering → arm stub → Go2 nav delivery)
+# --------------------------------------------------------------------------- #
+import vendor  # noqa: E402  (after app setup, before the catch-all static mount)
+
+app.include_router(vendor.router)
+
+
+@app.get("/vendor")
+def vendor_page():
+    return FileResponse(os.path.join(FRONTEND_DIR, "vendor.html"))
 
 
 # --------------------------------------------------------------------------- #

@@ -1453,6 +1453,117 @@ def lidar_status() -> Dict[str, object]:
     return _lidar_daemon.status()
 
 
+# --------------------------------------------------------------------------- #
+# Arm workcell USB camera daemon (backend/arm_camera_daemon.py)
+# --------------------------------------------------------------------------- #
+# Same manager shape as _CameraDaemon, but the source is a local USB camera —
+# no transport, NOT tied to the robot connection. Lives for the server's
+# lifetime; killed only via arm_camera_kill() on /api/server/shutdown.
+# Port 8772: clear of 8770 (go2 camera) and 8771 (lidar).
+_ARM_CAMERA_DAEMON_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "arm_camera_daemon.py")
+ARM_CAMERA_PORT = int(os.environ.get("ARM_CAMERA_PORT", "8772"))
+ARM_CAM_PY = os.environ.get("ARM_CAM_PY", DIMOS_PY)
+
+
+class _ArmCameraDaemon:
+    """Owns the single arm-camera subprocess. Thread-safe spawn/kill/ensure."""
+
+    def __init__(self) -> None:
+        self.proc: Optional[subprocess.Popen] = None
+        self.device: Optional[int] = None
+        self.port: int = ARM_CAMERA_PORT
+        self.ready: bool = False
+        self.lock = threading.Lock()
+
+    def _alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _readline(self, timeout: float) -> Optional[str]:
+        if self.proc is None or self.proc.stdout is None:
+            return None
+        r, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        if not r:
+            return None
+        return self.proc.stdout.readline()
+
+    def _kill_locked(self) -> None:
+        if self.proc is not None:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        self.proc = None
+        self.device = None
+        self.ready = False
+
+    def _spawn_locked(self, device: int) -> Dict[str, object]:
+        args = [ARM_CAM_PY, _ARM_CAMERA_DAEMON_PATH,
+                "--device", str(device), "--port", str(self.port)]
+        self.proc = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            start_new_session=True)
+        self.device = device
+        ready_line = self._readline(timeout=20)
+        if not ready_line:
+            self._kill_locked()
+            return {"ok": False,
+                    "error": "arm camera daemon did not signal readiness"}
+        try:
+            info = json.loads(ready_line)
+        except json.JSONDecodeError:
+            self._kill_locked()
+            return {"ok": False, "error": f"bad readiness line: {ready_line!r}"}
+        if not info.get("ready"):
+            self._kill_locked()
+            return {"ok": False,
+                    "error": info.get("error", "arm camera daemon init failed")}
+        self.ready = True
+        return {"ok": True, "port": self.port, "device": device}
+
+    def ensure(self, device: int = 0) -> Dict[str, object]:
+        with self.lock:
+            if self._alive() and self.device == device and self.ready:
+                return {"ok": True, "port": self.port, "device": device,
+                        "already": True}
+            self._kill_locked()
+            return self._spawn_locked(device)
+
+    def kill(self) -> None:
+        with self.lock:
+            self._kill_locked()
+
+    def status(self) -> Dict[str, object]:
+        with self.lock:
+            return {"alive": self._alive(), "ready": self.ready,
+                    "device": self.device, "port": self.port,
+                    "pid": self.proc.pid if self.proc else None}
+
+
+_arm_camera_daemon = _ArmCameraDaemon()
+
+
+def arm_camera_ensure(device: int = 0) -> Dict[str, object]:
+    """Lazily spawn (or reuse) the arm USB camera daemon."""
+    return _arm_camera_daemon.ensure(device)
+
+
+def arm_camera_kill() -> None:
+    _arm_camera_daemon.kill()
+
+
+def arm_camera_status() -> Dict[str, object]:
+    return _arm_camera_daemon.status()
+
+
 _ANSI_RE = _re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07")
 _SPY_ROW_RE = _re.compile(
     r"^(lcm|zenoh)\s+(\S+)\s+(\S+)\s+([\d.]+)\s+(.+?)\s*$"
