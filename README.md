@@ -1,5 +1,12 @@
 # dimOS Control
 
+> **⚠️ ARCHIVED (2026-07-26).** The canonical repo is now
+> **`dimos-pwa`** (github.com/liuliuliuLabs/dimos-pwa, branch `alex-branch`) —
+> the copy actually deployed on the Ascent GX10 (30.201.220.87). `demo-site/`
+> (the Vercel page) has been migrated there, along with the vendor state
+> machine tests. Do not develop here; this stays as history + docs
+> (`docs/patches/`, `docs/superpowers/` remain useful references).
+
 A PWA control panel for **dimOS** (dimensionalOS). It's a thin FastAPI app that
 shells out to the `dimos` CLI as subprocesses and exposes a graphical UI over it.
 It does **not** import dimOS Python modules or touch the dimOS conda env — it runs
